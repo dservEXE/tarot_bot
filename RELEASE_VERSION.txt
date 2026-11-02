@@ -1,0 +1,5 @@
+Tarot bot release: 2026-09-09
+Payment provider module: YooKassa redirect (cards / SBP when enabled)
+Internal report price: 499 tokens
+Payments default: disabled until owner setup
+Verification: 75 tests passed, 32 subtests passed; Python compilation passed

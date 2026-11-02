@@ -1,429 +1,204 @@
-"""
-matrix_image.py — Генерация картинки «Матрица судьбы» (метод Натальи Ладини)
-Использует только Pillow.
-
-ИНТЕГРАЦИЯ В main.py:
-  1. Положи этот файл рядом с main.py
-  2. В начало main.py добавь: from matrix_image import build_matrix_image
-  3. Замени вызов старого build_matrix_image на новый — сигнатура та же:
-       image_path = build_matrix_image(user)   # user — словарь из БД
-
-АЛГОРИТМ (метод Ладини / Фадеева):
-  A = день рождения          → Левая точка (Личность)
-  B = месяц рождения         → Верхняя точка (Дух)
-  C = год (сумма цифр)       → Правая точка (Материя)
-  D = reduce(A+B+C)          → Нижняя точка (Кармический хвост)
-  E = reduce(A+B+C+D)        → Центр (Зона комфорта)
-
-  Родовой квадрат:
-  F = reduce(A+B)  — верхний левый  (Отец × Дух)
-  G = reduce(B+C)  — верхний правый (Мать × Материя)
-  H = reduce(C+D)  — нижний правый  (Деньги)
-  K = reduce(D+A)  — нижний левый   (Любовь/Отношения)
-
-  Промежуточные (центры рёбер родового квадрата):
-  FG = reduce(F+G), GH = reduce(G+H), HK = reduce(H+K), KF = reduce(K+F)
-
-  Линии рода:
-    Мужская (отцовская):  A → F → B
-    Женская (материнская): B → G → C
-
-  Правило: если число > 22 — складываем цифры числа, пока не будет <= 22.
-"""
+"""Crisp, code-drawn destiny matrix; no network access or guessed AI geometry."""
+from __future__ import annotations
 
 import io
 import math
+import os
 import tempfile
-from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-# ─── Шрифты ──────────────────────────────────────────────────────────────────
-_FONT_BOLD   = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-_FONT_NORMAL = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+from matrix_model import METHOD_VERSION, calc_matrix, parse_birth_date
 
-def _f(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.truetype(_FONT_BOLD if bold else _FONT_NORMAL, size)
-    except Exception:
-        return ImageFont.load_default()
-
-# ─── Палитра ─────────────────────────────────────────────────────────────────
-BG_TOP     = (15,  12,  35)
-BG_BOT     = (28,  18,  60)
-GOLD       = (212, 175,  55)
-WHITE      = (255, 255, 255)
-GRAY_LIGHT = (200, 200, 220)
-GRAY_MID   = (130, 130, 160)
-
-NODE_COLORS = {
-    "A": (130,  80, 220),
-    "B": (210,  60, 140),
-    "C": (230, 130,  30),
-    "D": (210,  45,  45),
-    "E": (230, 195,  40),
-    "F": ( 55, 130, 220),
-    "G": ( 50, 180, 120),
-    "H": (220, 100,  40),
-    "K": (100, 180, 230),
+IMG_W, IMG_H = 1400, 2320
+CX, CY, R = 700, 768, 475
+INK = "#25243C"
+MUTED = "#6D7083"
+PALE = "#F4F3FA"
+LINE = "#CFD0DF"
+COLORS = {
+    "violet": ("#7560BC", "#EEE8FC"), "indigo": ("#556DC5", "#E9EDFD"),
+    "sky": ("#3A88BC", "#E4F3FC"), "green": ("#287969", "#E5F3ED"),
+    "gold": ("#8E6825", "#FBEECB"), "orange": ("#B16B36", "#FCEBDC"),
+    "coral": ("#B35D67", "#FBE9EB"), "blue": ("#557EAF", "#EDF2F9"),
+    "rose": ("#B46992", "#F8EEF4"),
 }
-MALE_COLOR   = (230,  80,  80)
-FEMALE_COLOR = (180,  80, 220)
-
-# ─── Размеры ─────────────────────────────────────────────────────────────────
-IMG_W   = 960
-IMG_H   = 1060
-CX      = 480
-CY      = 490
-R_BIG   = 310
-R_SMALL = int(R_BIG * 0.707)
-NODE_R  = 36
-MID_R   = 20
-
-# ─── Вспомогательные функции ─────────────────────────────────────────────────
-
-def _reduce(n: int) -> int:
-    n = abs(int(n))
-    while n > 22:
-        n = sum(int(ch) for ch in str(n))
-    return max(1, n)
 
 
-def _pretty_date(date_str: str) -> str:
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
-    except Exception:
-        return date_str
+@lru_cache(maxsize=64)
+def _font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    custom = os.getenv("MATRIX_FONT_BOLD" if bold else "MATRIX_FONT_REGULAR")
+    candidates = [custom] if custom else []
+    candidates += [
+        str(Path(__file__).parent / "assets" / "fonts" / ("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf")),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold else "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return ImageFont.truetype(candidate, size)
+    # Pillow's default font does not reliably contain Cyrillic. Fail clearly so
+    # paid delivery can be retried instead of shipping unreadable glyphs.
+    raise RuntimeError("Установите fonts-dejavu-core или укажите MATRIX_FONT_REGULAR/BOLD")
 
 
-def _tc(draw, x, y, text, font, fill):
-    """Text centered at (x, y)."""
-    bb = draw.textbbox((0, 0), text, font=font)
-    w, h = bb[2] - bb[0], bb[3] - bb[1]
-    draw.text((x - w // 2, y - h // 2), text, font=font, fill=fill)
+def _center(draw, xy, text, font, fill=INK):
+    draw.text(xy, str(text), font=font, fill=fill, anchor="mm")
 
 
-# ─── Расчёт матрицы ──────────────────────────────────────────────────────────
-
-def calc_matrix(date_str: str) -> dict:
-    d = datetime.strptime(date_str, "%Y-%m-%d")
-    A = _reduce(d.day)
-    B = _reduce(d.month)
-    C = _reduce(sum(int(ch) for ch in str(d.year)))
-    D = _reduce(A + B + C)
-    E = _reduce(A + B + C + D)
-    F  = _reduce(A + B)
-    G  = _reduce(B + C)
-    H  = _reduce(C + D)
-    K  = _reduce(D + A)
-    FG = _reduce(F + G)
-    GH = _reduce(G + H)
-    HK = _reduce(H + K)
-    KF = _reduce(K + F)
-    return dict(
-        A=A, B=B, C=C, D=D, E=E,
-        F=F, G=G, H=H, K=K,
-        FG=FG, GH=GH, HK=HK, KF=KF,
-        male_line=[A, F, B],
-        female_line=[B, G, C],
-    )
+def _fit(draw, text, width, size, bold=False):
+    text = " ".join(str(text).split())
+    while size > 21 and draw.textlength(text, font=_font(size, bold)) > width:
+        size -= 1
+    while text and draw.textlength(text, font=_font(size, bold)) > width:
+        text = text[:-2] + "…"
+    return text, _font(size, bold)
 
 
-# ─── Координаты узлов ────────────────────────────────────────────────────────
-
-def _nodes():
-    A  = (CX - R_BIG,  CY)
-    B  = (CX,          CY - R_BIG)
-    C  = (CX + R_BIG,  CY)
-    D  = (CX,          CY + R_BIG)
-    F  = (CX - R_SMALL, CY - R_SMALL)
-    G  = (CX + R_SMALL, CY - R_SMALL)
-    H  = (CX + R_SMALL, CY + R_SMALL)
-    K  = (CX - R_SMALL, CY + R_SMALL)
-    FG = ((F[0]+G[0])//2, (F[1]+G[1])//2)
-    GH = ((G[0]+H[0])//2, (G[1]+H[1])//2)
-    HK = ((H[0]+K[0])//2, (H[1]+K[1])//2)
-    KF = ((K[0]+F[0])//2, (K[1]+F[1])//2)
-    E  = (CX, CY)
-    return dict(A=A, B=B, C=C, D=D, E=E,
-                F=F, G=G, H=H, K=K,
-                FG=FG, GH=GH, HK=HK, KF=KF)
+def _point(node):
+    return CX + R * node["x"], CY + R * node["y"]
 
 
-# ─── Возрастная шкала ────────────────────────────────────────────────────────
-
-def _age_labels(nodes):
-    """Список (x, y, text) для меток возраста снаружи октаграммы."""
-    OFFSET = 42
-    result = []
-
-    def push(key, age):
-        x, y = nodes[key]
-        dx, dy = x - CX, y - CY
-        ln = math.hypot(dx, dy) or 1
-        ox = x + int(dx / ln * OFFSET)
-        oy = y + int(dy / ln * OFFSET)
-        result.append((ox, oy, f"{age} лет"))
-
-    def push_mid(k1, k2, age):
-        x1, y1 = nodes[k1]
-        x2, y2 = nodes[k2]
-        mx, my = (x1+x2)//2, (y1+y2)//2
-        dx, dy = mx - CX, my - CY
-        ln = math.hypot(dx, dy) or 1
-        ox = mx + int(dx / ln * OFFSET)
-        oy = my + int(dy / ln * OFFSET)
-        result.append((ox, oy, f"{age} лет"))
-
-    # вершины (по часовой от верха)
-    push("B", 0)
-    push("G", 10)
-    push("C", 20)
-    push("H", 30)
-    push("D", 40)
-    push("K", 50)
-    push("A", 60)
-    push("F", 70)
-
-    # середины рёбер
-    push_mid("B", "G",  5)
-    push_mid("G", "C", 15)
-    push_mid("C", "H", 25)
-    push_mid("H", "D", 35)
-    push_mid("D", "K", 45)
-    push_mid("K", "A", 55)
-    push_mid("A", "F", 65)
-    push_mid("F", "B", 75)
-
-    return result
+def _dashed(draw, start, end, color, width=3, dash=12, gap=9):
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy)
+    for offset in range(0, int(length), dash + gap):
+        stop = min(length, offset + dash)
+        draw.line([(start[0] + dx * offset / length, start[1] + dy * offset / length),
+                   (start[0] + dx * stop / length, start[1] + dy * stop / length)], fill=color, width=width)
 
 
-# ─── Рисование ───────────────────────────────────────────────────────────────
-
-def _gradient_bg(img):
-    draw = ImageDraw.Draw(img)
-    for y in range(IMG_H):
-        t = y / IMG_H
-        r = int(BG_TOP[0] + (BG_BOT[0]-BG_TOP[0]) * t)
-        g = int(BG_TOP[1] + (BG_BOT[1]-BG_TOP[1]) * t)
-        b = int(BG_TOP[2] + (BG_BOT[2]-BG_TOP[2]) * t)
-        draw.line([(0, y), (IMG_W, y)], fill=(r, g, b))
-
-
-def _node(draw, cx, cy, r, color, value, fnt):
-    # тень
-    draw.ellipse([cx-r+3, cy-r+3, cx+r+3, cy+r+3], fill=(5, 5, 20))
-    # свечение (3 кольца)
-    for i in (3, 2, 1):
-        gr = r + i * 5
-        gc = tuple(min(255, c + 20*i) for c in color)
-        draw.ellipse([cx-gr, cy-gr, cx+gr, cy+gr], outline=gc, width=1)
-    # заливка
-    draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=color, outline=GOLD, width=2)
-    # блик
-    br = r // 4
-    bx, by = cx - r//3, cy - r//3
-    lc = tuple(min(255, c+90) for c in color)
-    draw.ellipse([bx-br, by-br, bx+br, by+br], fill=lc)
-    # число
-    _tc(draw, cx, cy, str(value), fnt, WHITE)
+def _node(draw, node):
+    x, y = _point(node)
+    key = node["id"]
+    radius = 51 if key == "E" else 43 if len(key) == 1 and key not in "QLM" else 31
+    edge, fill = COLORS[node["color"]]
+    if key == "E":
+        draw.ellipse((x-radius-8, y-radius-8, x+radius+8, y+radius+8), outline="#EAD9A7", width=2)
+    draw.ellipse((x-radius, y-radius+4, x+radius, y+radius+4), fill="#E7E5EF")
+    draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=fill, outline=edge, width=2)
+    _center(draw, (x, y-14 if radius > 40 else y-11), key, _font(15 if radius > 40 else 12, True), edge)
+    _center(draw, (x, y+11 if radius > 40 else y+8), node["value"], _font(43 if radius > 40 else 30, True), INK)
 
 
-def _small_node(draw, cx, cy, r, value, fnt):
-    draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=(235, 230, 255), outline=(100, 90, 170), width=2)
-    _tc(draw, cx, cy, str(value), fnt, (40, 30, 80))
+def _card(draw, box, title, eyebrow=None):
+    draw.rounded_rectangle(box, radius=24, fill="#FFFFFF", outline="#E4E1ED", width=2)
+    x, y, _, _ = box
+    if eyebrow:
+        draw.text((x+30, y+22), eyebrow, font=_font(17, True), fill=COLORS["violet"][0])
+    draw.text((x+30, y+48 if eyebrow else y+24), title, font=_font(29, True), fill=INK)
 
-
-def _arrow_line(draw, p1, p2, color, w=3):
-    draw.line([p1, p2], fill=color, width=w)
-    dx, dy = p2[0]-p1[0], p2[1]-p1[1]
-    ln = math.hypot(dx, dy) or 1
-    ux, uy = dx/ln, dy/ln
-    px, py = -uy, ux
-    al, aw = 14, 6
-    tip = p2
-    a1 = (int(tip[0]-ux*al+px*aw), int(tip[1]-uy*al+py*aw))
-    a2 = (int(tip[0]-ux*al-px*aw), int(tip[1]-uy*al-py*aw))
-    draw.polygon([tip, a1, a2], fill=color)
-
-
-# ─── Главная функция ─────────────────────────────────────────────────────────
 
 def generate_matrix_image(date_str: str, name: str = "") -> bytes:
-    """
-    Генерирует PNG матрицы судьбы.
-    date_str: 'YYYY-MM-DD'
-    name:     имя пользователя (необязательно)
-    Возвращает bytes (PNG).
-    """
-    m  = calc_matrix(date_str)
-    nd = _nodes()
+    matrix = calc_matrix(date_str)
+    nodes = matrix["nodes"]
+    image = Image.new("RGB", (IMG_W, IMG_H), "#F8F7FC")
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((30, 28, IMG_W-30, IMG_H-28), radius=40, fill="#FCFBFF", outline="#E4E0EF", width=2)
+    _center(draw, (CX, 63), "ЛИЧНАЯ КАРТА · 22 АРКАНА", _font(20, True), COLORS["violet"][0])
+    _center(draw, (CX, 121), "Матрица судьбы", _font(56, True))
+    nice_date = parse_birth_date(date_str).strftime("%d.%m.%Y")
+    name = " ".join(str(name or "").split())[:120]
+    subtitle = f"{name}  ·  {nice_date}" if name else nice_date
+    subtitle, font = _fit(draw, subtitle, 1150, 27)
+    _center(draw, (CX, 174), subtitle, font, MUTED)
 
-    img = Image.new("RGB", (IMG_W, IMG_H))
-    _gradient_bg(img)
-    draw = ImageDraw.Draw(img)
+    # Correct age orientation: left=0, top=20, right=40, bottom=60.
+    perimeter = "AFBGCHDK"
+    for index, key in enumerate(perimeter):
+        vertex = _point(nodes[key])
+        next_vertex = _point(nodes[perimeter[(index+1) % 8]])
+        start = (CX+(vertex[0]-CX)*1.135, CY+(vertex[1]-CY)*1.135)
+        end = (CX+(next_vertex[0]-CX)*1.135, CY+(next_vertex[1]-CY)*1.135)
+        draw.line([start, end], fill="#E8E4F0", width=1)
+        for tick in range(1, 10):
+            t = tick / 10
+            x = start[0] + (end[0]-start[0])*t
+            y = start[1] + (end[1]-start[1])*t
+            dx, dy = x-CX, y-CY
+            length = math.hypot(dx, dy)
+            ux, uy = dx/length, dy/length
+            draw.line([(x, y), (x+ux*8, y+uy*8)], fill="#BDB8CD", width=2)
+            if tick == 5:
+                _center(draw, (x+ux*28, y+uy*28), f"{index*10+5}", _font(21), MUTED)
+        dx, dy = vertex[0]-CX, vertex[1]-CY
+        length = math.hypot(dx, dy)
+        label = "0 / 80 лет" if index == 0 else f"{index*10} лет"
+        offset = 122 if key == "A" else 100 if key == "C" else 82
+        _center(draw, (vertex[0]+dx/length*offset, vertex[1]+dy/length*offset), label, _font(22, True), MUTED)
 
-    # шрифты
-    F_TITLE  = _f(32, True)
-    F_SUB    = _f(18, False)
-    F_NODE   = _f(26, True)
-    F_MID    = _f(16, True)
-    F_AGE    = _f(11, False)
-    F_LEG    = _f(14, False)
-    F_LBL    = _f(12, False)
+    for keys in ("ABCD", "FGHK"):
+        for i, key in enumerate(keys):
+            draw.line([_point(nodes[key]), _point(nodes[keys[(i+1) % 4]])], fill=LINE, width=2)
+    draw.line([_point(nodes["A"]), _point(nodes["C"])], fill="#C9C5D6", width=2)
+    draw.line([_point(nodes["B"]), _point(nodes["D"])], fill="#C9C5D6", width=2)
+    for start, end, color in (("F", "H", "blue"), ("G", "K", "rose")):
+        draw.line([_point(nodes[start]), _point(nodes[end])], fill=COLORS[color][0], width=3)
+    _dashed(draw, _point(nodes["D1"]), _point(nodes["Q"]), COLORS["rose"][0], 4)
+    _dashed(draw, _point(nodes["Q"]), _point(nodes["C1"]), COLORS["green"][0], 4)
+    _center(draw, (CX+30, CY+167), "ОТНОШЕНИЯ", _font(16, True), COLORS["rose"][0])
+    _center(draw, (CX+245, CY+135), "ДЕНЬГИ", _font(17, True), COLORS["green"][0])
+    # Clean uninterrupted labels in empty quadrants.
+    _center(draw, (CX-211, CY+83), "ЛИНИЯ МАТЕРИ", _font(17, True), COLORS["rose"][0])
+    _center(draw, (CX-211, CY-83), "ЛИНИЯ ОТЦА", _font(17, True), COLORS["blue"][0])
+    for node in nodes.values():
+        _node(draw, node)
 
-    # ── Заголовок ─────────────────────────────────────────────────────────
-    _tc(draw, IMG_W//2, 36, "✦  Матрица Судьбы  ✦", F_TITLE, GOLD)
-    parts = ([name] if name else []) + [_pretty_date(date_str)]
-    _tc(draw, IMG_W//2, 70, "  •  ".join(parts), F_SUB, GRAY_LIGHT)
-    draw.line([(IMG_W//2-200, 88), (IMG_W//2+200, 88)], fill=GOLD, width=1)
+    _center(draw, (CX, 1362), "Число в круге — аркан. Буква — адрес точки в разборе.", _font(23), MUTED)
+    _center(draw, (CX, 1399), "Внешняя шкала — возрастные ориентиры; штрих = 1 год.", _font(21), MUTED)
 
-    # ── Рёбра родового квадрата ───────────────────────────────────────────
-    sq = ["F","G","H","K"]
-    for i in range(4):
-        draw.line([nd[sq[i]], nd[sq[(i+1)%4]]], fill=(90, 80, 150), width=2)
+    _card(draw, (85, 1450, 675, 1740), "Твои направления", "ИТОГИ СХЕМЫ")
+    for index, key in enumerate(("personal", "social", "spiritual", "planetary")):
+        y = 1545 + index*43
+        item = matrix["summaries"][key]
+        draw.text((115, y), item["title"], font=_font(23), fill=MUTED)
+        draw.text((637, y), str(item["value"]), font=_font(26, True), fill=INK, anchor="ra")
+    _card(draw, (700, 1450, 1315, 1740), "Твоя опора", "ВЗАИМОСВЯЗИ")
+    for index, (label, keys) in enumerate((("Небо · Земля", ("sky", "earth")),
+                                         ("Отец · Мать", ("father", "mother")),
+                                         ("Личная · Родовая", ("E", "family_center")),
+                                         ("Общая опора", ("total_center",)))):
+        y = 1545+index*43
+        draw.text((730, y), label, font=_font(23), fill=MUTED)
+        draw.text((1278, y), " · ".join(str(matrix[k]) for k in keys), font=_font(26, True), fill=INK, anchor="ra")
 
-    # ── Диагонали родового квадрата ───────────────────────────────────────
-    draw.line([nd["F"], nd["H"]], fill=(60, 55, 110), width=1)
-    draw.line([nd["G"], nd["K"]], fill=(60, 55, 110), width=1)
-
-    # ── Рёбра диагонального квадрата (ромб) ──────────────────────────────
-    dia = ["A","B","C","D"]
-    for i in range(4):
-        draw.line([nd[dia[i]], nd[dia[(i+1)%4]]], fill=(150, 140, 200), width=2)
-
-    # ── Оси ───────────────────────────────────────────────────────────────
-    draw.line([nd["B"], nd["D"]], fill=(150, 140, 200), width=2)
-    draw.line([nd["A"], nd["C"]], fill=(150, 140, 200), width=2)
-
-    # ── Лучи от центра к углам родового квадрата ─────────────────────────
-    for k in ["F","G","H","K"]:
-        draw.line([nd["E"], nd[k]], fill=(60, 55, 110), width=1)
-
-    # ── Мужская линия: A → F → B ─────────────────────────────────────────
-    _arrow_line(draw, nd["A"], nd["F"], MALE_COLOR, 3)
-    _arrow_line(draw, nd["F"], nd["B"], MALE_COLOR, 3)
-    lmx = (nd["A"][0]+nd["F"][0])//2 - 72
-    lmy = (nd["A"][1]+nd["F"][1])//2 + 4
-    draw.text((lmx, lmy), "линия\nмужского рода", font=F_LBL, fill=MALE_COLOR)
-
-    # ── Женская линия: B → G → C ─────────────────────────────────────────
-    _arrow_line(draw, nd["B"], nd["G"], FEMALE_COLOR, 3)
-    _arrow_line(draw, nd["G"], nd["C"], FEMALE_COLOR, 3)
-    lfx = (nd["C"][0]+nd["G"][0])//2 + 8
-    lfy = (nd["C"][1]+nd["G"][1])//2 - 32
-    draw.text((lfx, lfy), "линия\nженского рода", font=F_LBL, fill=FEMALE_COLOR)
-
-    # ── Символы $ и ♥ ─────────────────────────────────────────────────────
-    ex, ey = nd["E"]
-    hx, hy = nd["H"]
-    kx, ky = nd["K"]
-    _tc(draw, (ex+hx)//2+14, (ey+hy)//2,    "$", _f(22,True), (80,200,100))
-    _tc(draw, (ex+kx)//2-14, (ey+ky)//2+4,  "♥", _f(20,True), (220,80,80))
-
-    # ── Возрастная шкала ──────────────────────────────────────────────────
-    for ax, ay, age_text in _age_labels(nd):
-        bb = draw.textbbox((0,0), age_text, font=F_AGE)
-        aw = bb[2]-bb[0]
-        draw.text((ax-aw//2, ay-7), age_text, font=F_AGE, fill=GRAY_MID)
-
-    # ── Маленькие узлы ────────────────────────────────────────────────────
-    for k in ["FG","GH","HK","KF"]:
-        px, py = nd[k]
-        _small_node(draw, px, py, MID_R, m[k], F_MID)
-
-    # ── Большие узлы ─────────────────────────────────────────────────────
-    node_labels = {
-        "A":"Личность","B":"Дух","C":"Материя","D":"Карма",
-        "E":"Центр","F":"Отец×Дух","G":"Мать×Мат","H":"Деньги","K":"Любовь",
-    }
-    for key in ["A","B","C","D","F","G","H","K","E"]:
-        px, py = nd[key]
-        r = NODE_R + 5 if key == "E" else NODE_R
-        _node(draw, px, py, r, NODE_COLORS[key], m[key], F_NODE)
-        lbl = node_labels[key]
-        bb = draw.textbbox((0,0), lbl, font=F_LBL)
-        lw = bb[2]-bb[0]
-        draw.text((px-lw//2, py+r+6), lbl, font=F_LBL, fill=GRAY_MID)
-
-    # ── Блок внизу ───────────────────────────────────────────────────────
-    bot_y = CY + R_BIG + 70
-    draw.line([(40, bot_y-10), (IMG_W-40, bot_y-10)], fill=(80,70,130), width=1)
-
-    male_str   = "  ·  ".join(str(x) for x in m["male_line"])
-    female_str = "  ·  ".join(str(x) for x in m["female_line"])
-    draw.text((50, bot_y),
-              f"♂  Родовые программы (мужская линия):   {male_str}",
-              font=F_LEG, fill=MALE_COLOR)
-    draw.text((50, bot_y+24),
-              f"♀  Родовые программы (женская линия):    {female_str}",
-              font=F_LEG, fill=FEMALE_COLOR)
-
-    legend_items = [
-        ("A", m["A"], "Личность (день)",      NODE_COLORS["A"]),
-        ("B", m["B"], "Дух (месяц)",           NODE_COLORS["B"]),
-        ("C", m["C"], "Материя (год)",          NODE_COLORS["C"]),
-        ("D", m["D"], "Кармич. хвост",          NODE_COLORS["D"]),
-        ("E", m["E"], "Зона комфорта",          NODE_COLORS["E"]),
-        ("F", m["F"], "Отец × Дух",             NODE_COLORS["F"]),
-        ("G", m["G"], "Мать × Материя",         NODE_COLORS["G"]),
-        ("H", m["H"], "Деньги / здоровье",      NODE_COLORS["H"]),
-        ("K", m["K"], "Любовь / отношения",     NODE_COLORS["K"]),
-    ]
-    leg_y = bot_y + 56
-    cols, col_w = 3, IMG_W // 3
-    for i, (lbl, val, desc, col) in enumerate(legend_items):
-        ci, ri = i % cols, i // cols
-        lx = ci*col_w + 50
-        ly = leg_y + ri*24
-        draw.ellipse([lx, ly+3, lx+14, ly+17], fill=col)
-        draw.text((lx+20, ly+1), f"{lbl} = {val}  —  {desc}", font=F_LEG, fill=GRAY_LIGHT)
-
-    # ── Рамка ────────────────────────────────────────────────────────────
-    draw.rectangle([4, 4, IMG_W-5, IMG_H-5], outline=GOLD, width=2)
-    draw.rectangle([8, 8, IMG_W-9, IMG_H-9], outline=(80,70,130), width=1)
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    buf.seek(0)
-    return buf.read()
+    _card(draw, (85, 1780, 1315, 2202), "Ресурсные уровни", "СИМВОЛИЧЕСКАЯ КАРТА")
+    columns = (124, 744, 943, 1170)
+    for x, label in zip(columns, ("Сфера", "Действие", "Восприятие", "Баланс")):
+        draw.text((x, 1871), label, font=_font(21, True), fill=MUTED)
+    for index, row in enumerate(matrix["resources"]):
+        y = 1916 + index*36
+        if index % 2 == 0:
+            draw.rounded_rectangle((110, y-5, 1289, y+30), radius=8, fill="#F6F4FA")
+        draw.text((columns[0], y), row["title"], font=_font(23), fill=INK)
+        for x, field in zip(columns[1:], ("left", "right", "balance")):
+            draw.text((x+30, y), str(row[field]), font=_font(24, True), fill=INK)
+    _center(draw, (CX, 2243), "Карта для самопознания. Значения — темы для размышления, не предсказания.", _font(19), MUTED)
+    _center(draw, (CX, 2276), "Расчёт по дате рождения · 8 — Справедливость · 11 — Сила", _font(18), MUTED)
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG", optimize=True)
+    return buffer.getvalue()
 
 
-# ─── Совместимость с main.py ─────────────────────────────────────────────────
-
-def build_matrix_image(user: dict) -> "str | None":
-    """
-    Принимает словарь user из БД (как в твоём main.py).
-    Сохраняет PNG во временный файл, возвращает путь к файлу.
-    Возвращает None при ошибке или отсутствии birth_date.
-    """
-    date_str = user.get("birth_date")
-    if not date_str:
-        return None
-    try:
-        png = generate_matrix_image(date_str, user.get("name", ""))
-        path = Path(tempfile.gettempdir()) / f"matrix_{user.get('telegram_id','tmp')}.png"
-        path.write_bytes(png)
-        return str(path)
-    except Exception as e:
-        print(f"[matrix_image] Ошибка: {e}")
-        return None
+def build_matrix_image(user: dict) -> str:
+    """Return an independent temporary PNG; the caller deletes it after sending."""
+    user = dict(user)
+    png = generate_matrix_image(user.get("birth_date"), user.get("name", ""))
+    with tempfile.NamedTemporaryFile(prefix="matrix_", suffix=".png", delete=False) as handle:
+        handle.write(png)
+        return handle.name
 
 
-# ─── Тест из командной строки ────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-    date = sys.argv[1] if len(sys.argv) > 1 else "1990-06-15"
-    name = sys.argv[2] if len(sys.argv) > 2 else "Иван Иванов"
-    png  = generate_matrix_image(date, name)
-    out  = "/tmp/matrix_preview.png"
-    with open(out, "wb") as f:
-        f.write(png)
-    m = calc_matrix(date)
-    print(f"Матрица для {name} ({date}):")
-    for k in ["A","B","C","D","E","F","G","H","K"]:
-        print(f"  {k} = {m[k]}")
-    print(f"  Мужская: {m['male_line']}")
-    print(f"  Женская: {m['female_line']}")
-    print(f"Сохранено: {out}")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("date", nargs="?", default="1984-10-31")
+    parser.add_argument("--name", default="Александра")
+    parser.add_argument("--output", default="matrix-preview.png")
+    args = parser.parse_args()
+    Path(args.output).write_bytes(generate_matrix_image(args.date, args.name))
+    print(args.output)

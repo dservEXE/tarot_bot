@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -19,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -27,6 +28,8 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+
+from config import get_settings
 
 from db import (
     add_tokens,
@@ -69,28 +72,53 @@ from horoscope import (
 
 # Новый модуль генерации матрицы судьбы (октаграмма Фадеева)
 from matrix_image import build_matrix_image
+from matrix_model import calc_matrix, ARCANA as MATRIX_ARCANA
+from matrix_report import build_matrix_report, build_matrix_report_html
+import commerce
+from app_services import init_app, has_consent, accept_consent, get_daily_reading
+from admin_panel import make_admin_router
+from payment_router import make_payment_router, wallet_keyboard
+from legal_documents import terms_text, privacy_text
+from launch_actions import run_configured_actions
+from yookassa_provider import reconciliation_loop
 
-BOT_TOKEN = "8539615509:AAGmG2Nimijudxe_sZAW__84hXkpEuCndhk"
-ADMIN_ID = 982023162
 DEFAULT_TIMEZONE = "Europe/Moscow"
 FULL_READING_PRICE = 10
 MATCH_PRICE = 15
 SUBSCRIPTION_PRICE = 199
 SUBSCRIPTION_DAYS = 30
-MATRIX_PRICE = 349
+MATRIX_PRICE = commerce.PRODUCT_PRICES['matrix']
+MATRIX_REPORT_PRICE = commerce.PRODUCT_PRICES['matrix_report']
 DEFAULT_NOTIFY_TIME = "09:00"
+REFERRER_BONUS = 5
+REFERRAL_FRIEND_BONUS = 10
 
 logging.basicConfig(level=logging.INFO)
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+bot: Bot | None = None
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
+dp.include_router(make_admin_router(set(get_settings().admin_ids)))
+dp.include_router(make_payment_router())
 dp.include_router(router)
 
 BOT_USERNAME: str | None = None
+_matrix_active: set[int] = set()
+_matrix_workers = asyncio.Semaphore(2)
+
+
+class PrivateChatMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        message = event.message if isinstance(event, CallbackQuery) else event
+        if getattr(getattr(message, 'chat', None), 'type', None) != 'private':
+            if isinstance(event, CallbackQuery):
+                await event.answer('Открой личный чат с ботом.', show_alert=True)
+            return
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(PrivateChatMiddleware())
+dp.callback_query.outer_middleware(PrivateChatMiddleware())
 
 
 class Onboarding(StatesGroup):
@@ -108,10 +136,6 @@ class ScheduleSetup(StatesGroup):
     minute = State()
 
 
-class AdminStates(StatesGroup):
-    waiting_for_user_id = State()
-    waiting_for_tokens = State()
-    waiting_for_broadcast = State()
 
 
 # ---------------------------
@@ -123,12 +147,16 @@ def e(value) -> str:
 
 
 def is_admin(user_id: int | None) -> bool:
-    return user_id == ADMIN_ID
+    return user_id in get_settings().admin_ids
 
 
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📋 Меню")]],
+        keyboard=[
+            [KeyboardButton(text="🔮 Мой расклад", style="primary")],
+            [KeyboardButton(text="✦ Матрица судьбы"), KeyboardButton(text="📋 Меню")],
+            [KeyboardButton(text="💳 Пополнить токены", style="success")],
+        ],
         resize_keyboard=True,
     )
 
@@ -136,19 +164,19 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
 def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="🔮 Расклады", callback_data="menu:readings"),
-            InlineKeyboardButton(text="🧮 Матрица судьбы", callback_data="menu:matrix"),
+            InlineKeyboardButton(text="🔮 Расклады", callback_data="menu:readings", style="primary"),
+            InlineKeyboardButton(text="✦ Матрица судьбы", callback_data="menu:matrix", style="primary"),
+        ],
+        [
+            InlineKeyboardButton(text="💕 Совместимость", callback_data="menu:match"),
+            InlineKeyboardButton(text="⭐ Подписка", callback_data="menu:subscription"),
         ],
         [
             InlineKeyboardButton(text="👤 Профиль", callback_data="menu:profile"),
-            InlineKeyboardButton(text="💰 Токены", callback_data="menu:tokens"),
+            InlineKeyboardButton(text="💳 Токены", callback_data="menu:tokens", style="success"),
         ],
         [
-            InlineKeyboardButton(text="🎁 Подписка", callback_data="menu:subscription"),
-            InlineKeyboardButton(text="👥 Совместимость", callback_data="menu:match"),
-        ],
-        [
-            InlineKeyboardButton(text="⏰ Рассылка", callback_data="menu:schedule"),
+            InlineKeyboardButton(text="⏰ Доставка", callback_data="menu:schedule"),
             InlineKeyboardButton(text="ℹ️ О боте", callback_data="menu:about"),
         ],
     ]
@@ -157,16 +185,6 @@ def main_menu_keyboard(user_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
-            [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users")],
-            [InlineKeyboardButton(text="💰 Выдать токены", callback_data="admin:give_tokens")],
-            [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin:broadcast")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:main")],
-        ]
-    )
 
 
 def back_button(back_cb: str, text: str = "⬅️ Назад") -> InlineKeyboardMarkup:
@@ -185,17 +203,17 @@ def one_row_buttons(*buttons: tuple[str, str], back_cb: str | None = None) -> In
 
 
 def readings_menu_keyboard(user) -> InlineKeyboardMarkup:
-    full_free = subscription_active(user) or full_unlocked_today(user, current_local_date(user))
+    full_free = bool(user) and (subscription_active(user) or full_unlocked_today(user, current_local_date(user)))
     full_label = "💎 Полный — открыт" if full_free else f"💎 Полный • {FULL_READING_PRICE}"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🌟 Краткий расклад", callback_data="reading:short"),
-                InlineKeyboardButton(text=full_label, callback_data="reading:full"),
+                InlineKeyboardButton(text="☀️ Краткий · бесплатно", callback_data="reading:short"),
+                InlineKeyboardButton(text=full_label, callback_data="reading:full", style="primary"),
             ],
             [
-                InlineKeyboardButton(text="🧿 Личная матрица", callback_data="reading:personal"),
+                InlineKeyboardButton(text="🧿 Личный портрет", callback_data="reading:personal"),
                 InlineKeyboardButton(text="📅 Код дня", callback_data="reading:daycode"),
             ],
             [
@@ -212,24 +230,7 @@ def readings_menu_keyboard(user) -> InlineKeyboardMarkup:
 
 
 def tokens_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="➕ 50", callback_data="tokens:buy:50"),
-                InlineKeyboardButton(text="➕ 100", callback_data="tokens:buy:100"),
-            ],
-            [
-                InlineKeyboardButton(text="➕ 250", callback_data="tokens:buy:250"),
-                InlineKeyboardButton(text="➕ 500", callback_data="tokens:buy:500"),
-            ],
-            [
-                InlineKeyboardButton(text="💰 Баланс", callback_data="tokens:balance"),
-            ],
-            [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="back:main"),
-            ],
-        ]
-    )
+    return wallet_keyboard()
 
 
 def profile_menu_keyboard(has_profile: bool) -> InlineKeyboardMarkup:
@@ -239,47 +240,45 @@ def profile_menu_keyboard(has_profile: bool) -> InlineKeyboardMarkup:
     if not has_profile:
         rows.append([InlineKeyboardButton(text="▶️ Продолжить заполнение", callback_data="profile:continue")])
     rows.append([InlineKeyboardButton(text="✏️ Сбросить профиль", callback_data="profile:reset")])
+    rows.append([InlineKeyboardButton(text="🌍 Часовой пояс доставки", callback_data="profile:timezone")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def schedule_menu_keyboard(user) -> InlineKeyboardMarkup:
-    time_label = user["notify_time"] or "не задано"
     enabled = bool(user["notify_enabled"]) if user is not None else True
-    toggle_text = "❌ Отключить ежедневную рассылку" if enabled else "▶️ Включить ежедневную рассылку"
+    toggle_text = "⏸ Отключить доставку" if enabled else "▶️ Включить доставку"
     toggle_cb = "schedule:disable_prompt" if enabled else "schedule:enable"
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⏰ Изменить время", callback_data="schedule:set_time")],
             [InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb)],
-            [InlineKeyboardButton(text=f"📍 Время: {time_label}", callback_data="schedule:time_info")],
+            [InlineKeyboardButton(text="🌍 Изменить часовой пояс", callback_data="profile:timezone")],
+            [InlineKeyboardButton(text="⭐ Моя подписка", callback_data="menu:subscription")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:main")],
         ]
     )
 
 
 def subscription_menu_keyboard(user) -> InlineKeyboardMarkup:
-    active = subscription_active(user)
-    if active:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отменить подписку", callback_data="sub:cancel_prompt")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:main")],
-            ]
-        )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"🎁 Оформить подписку • {SUBSCRIPTION_PRICE}", callback_data="sub:buy_prompt")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:main")],
+    if subscription_active(user):
+        rows = [
+            [InlineKeyboardButton(text='💎 Расклад на сегодня', callback_data='reading:full', style='primary')],
+            [InlineKeyboardButton(text='👥 Совместимость', callback_data='menu:match')],
+            [InlineKeyboardButton(text='⏰ Настроить доставку', callback_data='menu:schedule')],
         ]
-    )
+    else:
+        rows = [[InlineKeyboardButton(text=f'⭐ Подключить · {SUBSCRIPTION_PRICE} токенов', callback_data='sub:buy_prompt', style='primary')]]
+    rows.append([InlineKeyboardButton(text='⬅️ Главное меню', callback_data='back:main')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def confirm_keyboard(confirm_cb: str, back_cb: str, confirm_text: str = "✅ Подтвердить") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=confirm_text, callback_data=confirm_cb)],
+            [InlineKeyboardButton(text=confirm_text, callback_data=confirm_cb,
+                                  style='danger' if 'reset' in confirm_cb or 'disable' in confirm_cb else 'primary')],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)],
         ]
     )
@@ -372,6 +371,16 @@ def referral_link(user_id: int) -> str | None:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
 
 
+def referral_explanation(link: str) -> str:
+    return (
+        '<b>🎁 Пригласи друга — бонус обоим</b>\n'
+        f'Тебе — <b>{REFERRER_BONUS} токенов</b>, другу — <b>{REFERRAL_FRIEND_BONUS} токенов</b>.\n'
+        'Начислим, когда друг впервые запустит бота по твоей ссылке. '
+        'Один раз за каждого нового пользователя.\n'
+        f'{e(link)}'
+    )
+
+
 def missing_profile_steps(user) -> list[str]:
     missing = []
     if not user["birth_date"]:
@@ -384,7 +393,7 @@ def missing_profile_steps(user) -> list[str]:
 
 
 def profile_complete(user) -> bool:
-    return len(missing_profile_steps(user)) == 0
+    return bool(user) and len(missing_profile_steps(user)) == 0
 
 
 def subscription_active(user) -> bool:
@@ -392,6 +401,8 @@ def subscription_active(user) -> bool:
         return False
     try:
         until = datetime.fromisoformat(user["subscription_until"])
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
         return until > datetime.now(timezone.utc)
     except Exception:
         return False
@@ -413,26 +424,30 @@ def format_profile(user) -> str:
     username = f"@{user['username']}" if user["username"] else "не задан"
     personal_arcana = user["personal_arcana"] or (personal_arcana_from_birth_date(user["birth_date"]) if user["birth_date"] else "не задан")
     personal_arcana_label_text = arcana_label(personal_arcana) if user["birth_date"] else "не задан"
-    sub_text = "активна" if subscription_active(user) else "нет"
-    matrix_text = "открыта" if user["matrix_access"] else "не открыта"
+    sub_text = f"до {pretty_iso_dt(user['subscription_until'])}" if subscription_active(user) else "не подключена"
 
     text = f"""
-<b>👤 Профиль</b>
+<b>👤 Твой профиль</b>
+{e(user['name'])} · {e(username)}
 
-• <b>Имя:</b> {e(user['name'])}
-• <b>Telegram:</b> {e(username)}
-• <b>Дата рождения:</b> {pretty_date(user['birth_date'])}
-• <b>Время рождения:</b> {pretty_time(user['birth_time'])}
-• <b>Место рождения:</b> {e(user['birth_place'] or 'не задано')}
-• <b>Знак зодиака:</b> {e(zodiac)}
-• <b>Стихия:</b> {e(element)}
-• <b>Число пути:</b> {life_num if life_num is not None else 'не задано'}
-• <b>Личный аркан:</b> {e(personal_arcana_label_text)}
-• <b>Токены:</b> {tokens}
-• <b>Подписка:</b> {sub_text}
-• <b>Матрица судьбы:</b> {matrix_text}
-• <b>Время рассылки:</b> {pretty_time(user['notify_time'])}
-• <b>Часовой пояс:</b> {e(user['timezone'] or DEFAULT_TIMEZONE)}
+<b>Данные рождения</b>
+Дата · {pretty_date(user['birth_date'])}
+Время · {pretty_time(user['birth_time'])}
+Место · {e(user['birth_place'] or 'не задано')}
+
+<b>Твой символический портрет</b>
+Знак · {e(zodiac)} · {e(element)}
+Число пути · {life_num if life_num is not None else 'не задано'}
+Личный аркан · {e(personal_arcana_label_text)}
+
+<b>Баланс и доступ</b>
+◈ {tokens} токенов
+⭐ Подписка · {sub_text}
+Схема и разбор — в разделе «Матрица судьбы».
+
+<b>Доставка расклада</b>
+Время · {pretty_time(user['notify_time'])}
+Часовой пояс · {e(user['timezone'] or DEFAULT_TIMEZONE)}
 """
     if not profile_complete(user):
         text += "\n<b>Осталось заполнить:</b>\n"
@@ -441,7 +456,7 @@ def format_profile(user) -> str:
 
     link = referral_link(user["telegram_id"])
     if link:
-        text += f"\n<b>Реферальная ссылка:</b>\n{e(link)}\n"
+        text += '\n' + referral_explanation(link) + '\n'
 
     return text
 
@@ -475,6 +490,7 @@ def format_full_reading(reading, local_date: date_cls) -> str:
 💼 <b>Работа:</b> {e(reading['work'])}
 💰 <b>Деньги:</b> {e(reading['money'])}
 
+<i>Условные акценты дня, не вероятности событий:</i>
 🤝 <b>Контактность:</b> {reading['social']}%
 🧠 <b>Интуиция:</b> {reading['intuition']}%
 🎯 <b>Фокус:</b> {reading['focus']}%
@@ -488,11 +504,13 @@ def format_full_reading(reading, local_date: date_cls) -> str:
 🔢 <b>Число пути:</b> {reading['life_path_number'] if reading['life_path_number'] is not None else 'не задано'}
 🎨 <b>Цвет дня:</b> {e(reading['color'])}
 ⏳ <b>Лучшее время:</b> {e(reading['timing'])}
-📍 <b>Место рождения:</b> {e(reading['birth_place_hint'])}
+📍 <b>Личный акцент:</b> {e(reading['birth_place_hint'])}
 
 💬 <b>Совет:</b> {e(reading['advice'])}
 🧿 <b>Ритуал:</b> {e(reading['ritual'])}
 🗝 <b>Фраза дня:</b> {e(reading['mantra'])}
+
+<i>{"Интерпретация дополнена ИИ" if reading.get("generation_source") == "ai" else "Персональная алгоритмическая интерпретация"}</i>
 """
 
 
@@ -504,13 +522,20 @@ def format_personal_matrix(user) -> str:
     personal_arcana_label_text = arcana_label(personal_arcana) if user["birth_date"] else "не задан"
 
     return f"""
-<b>🧿 Личная матрица</b>
+<b>🧿 Личный портрет</b>
+
+Четыре ориентира, с которых можно начать знакомство с собой.
 
 • <b>Знак:</b> {e(zodiac)}
 • <b>Стихия:</b> {e(element)}
 • <b>Число пути:</b> {life_num if life_num is not None else 'не задано'}
 • <b>Личный аркан:</b> {e(personal_arcana_label_text)}
 • <b>Место рождения:</b> {e(user['birth_place'] or 'не задано')}
+
+Знак и стихия задают образ темперамента, число пути — тему развития,
+а личный аркан — символ для размышления о своих привычках и сильных сторонах.
+
+Подробная схема с линиями и позициями — в разделе «Матрица судьбы».
 """
 
 
@@ -524,7 +549,8 @@ def format_day_code_text(local_date: date_cls) -> str:
 • <b>Аркан дня:</b> {arcana_label(arc)}
 • <b>Смысл:</b> {arcana_meaning(arc)}
 
-Этот код одинаков для всех пользователей на эту дату.
+Это общий символический фон даты — он одинаков для всех.
+В разделе «Расклады» ты найдёшь личную интерпретацию дня с учётом своего профиля.
 """
 
 
@@ -560,18 +586,19 @@ def format_full_pay_prompt(user, local_date: date_cls) -> str:
     return f"""
 <b>💎 Полный расклад на сегодня</b>
 
-Это глубокий разбор на день: он показывает не только общий вектор, но и риск, шанс, деньги, отношения и совет.
+Больше деталей, чтобы спокойно расставить акценты на {local_date.strftime('%d.%m')}.
 
-Ты увидишь:
-• где скрыта возможность
-• что может помешать
-• на что сделать ставку сегодня
+<b>Что внутри</b>
+• Отношения, работа и деньги.
+• Возможности дня и то, что может помешать.
+• Личный совет, небольшой ритуал и фраза дня.
 
-• <b>Разовый доступ:</b> {FULL_READING_PRICE} токенов
-• <b>Подписка на 30 дней:</b> {SUBSCRIPTION_PRICE} токенов
-• <b>Баланс:</b> {tokens}
+<b>Открыть на сегодня · {FULL_READING_PRICE} токенов</b>
+Повторный просмотр сегодня — без доплаты.
+Твой баланс · {tokens} токенов
 
-Если берёшь полный расклад регулярно, подписка становится выгоднее уже очень быстро.
+⭐ Читаешь регулярно? Подписка на {SUBSCRIPTION_DAYS} дней — {SUBSCRIPTION_PRICE} токенов.
+{subscription_savings_text()}
 """
 
 
@@ -579,35 +606,58 @@ def format_match_pay_prompt(user, target_username: str) -> str:
     tokens = int(user["tokens"] or 0)
     premium = subscription_active(user)
     price = 0 if premium else MATCH_PRICE
-    price_text = "Бесплатно для подписчиков" if premium else f"{price} токенов"
+    price_text = "Включено в твою подписку" if premium else f"{price} токенов"
 
     return f"""
 <b>👥 Совместимость</b>
 
 Партнёр: @{e(target_username)}
 
-Этот расчёт покажет, как складывается ваша связка сегодня: где притяжение, где риск и как лучше говорить друг с другом.
+Взгляд на вашу пару сегодня: что сближает, где могут возникнуть разногласия
+и как сделать общение теплее. Внутри — сильная сторона пары и совет на день.
 
 • <b>Стоимость:</b> {price_text}
 • <b>Баланс:</b> {tokens}
 
-После открытия расчёт доступен сразу, а в течение этого дня повторно платить не придётся.
+Доступ действует сегодня; повторный просмотр — без доплаты.
+С подпиской совместимость уже включена.
 """
+
+
+def subscription_savings_text() -> str:
+    separate = FULL_READING_PRICE * SUBSCRIPTION_DAYS
+    savings = separate - SUBSCRIPTION_PRICE
+    if savings <= 0:
+        return 'Сравни стоимость с тем, как часто ты открываешь полный расклад.'
+    threshold = SUBSCRIPTION_PRICE // FULL_READING_PRICE + 1
+    token_word = 'токенов' if 11 <= savings % 100 <= 14 else (
+        'токен' if savings % 10 == 1 else 'токена' if savings % 10 in (2, 3, 4) else 'токенов'
+    )
+    return (
+        f'{SUBSCRIPTION_DAYS} ежедневных раскладов по отдельности — {separate} токенов. '
+        f'С подпиской экономия — <b>{savings} {token_word}</b>.\n'
+        f'Она выгоднее разовых покупок, если открывать полный расклад '
+        f'хотя бы {threshold} дней за срок подписки.'
+    )
 
 
 def format_subscription_prompt(user) -> str:
     tokens = int(user["tokens"] or 0)
     return f"""
-<b>⭐ Подписка на ежедневный полный расклад</b>
+<b>⭐ Подключить подписку</b>
 
-Каждый день ты получаешь полный разбор автоматически в выбранное время.
-Без доплат внутри срока, без лишних действий, без повторных платежей за каждый новый день.
+<b>{SUBSCRIPTION_DAYS} дней · {SUBSCRIPTION_PRICE} токенов</b>
+Срок начнётся сразу после подтверждения.
 
-• <b>Стоимость:</b> {SUBSCRIPTION_PRICE} токенов
-• <b>Срок:</b> {SUBSCRIPTION_DAYS} дней
-• <b>Баланс:</b> {tokens}
+💎 Полный расклад каждый день.
+👥 Совместимость без отдельных списаний.
+⏰ Доставка в выбранное время, если она включена в настройках.
 
-Подписка особенно выгодна, если ты берёшь полный расклад регулярно.
+С баланса спишется <b>{SUBSCRIPTION_PRICE} токенов</b>.
+Сейчас на балансе · {tokens} токенов
+
+<b>Без автопродления.</b> Следующее подключение — только по твоему решению.
+Схема и разбор матрицы приобретаются отдельно.
 """
 
 
@@ -615,66 +665,39 @@ def format_subscription_menu_text(user) -> str:
     active = subscription_active(user)
     if active:
         return f"""
-<b>🎁 Подписка</b>
+<b>⭐ Твоя подписка активна</b>
+Действует до <b>{pretty_iso_dt(user['subscription_until'])}</b>
 
-Статус: <b>активна</b>
-До: <b>{pretty_iso_dt(user['subscription_until'])}</b>
-Время рассылки: <b>{pretty_time(user['notify_time'])}</b>
+<b>Уже включено</b>
+💎 Полный расклад на каждый день.
+👥 Совместимость без отдельных списаний.
+⏰ Автоматическая доставка в удобное время.
 
-Ежедневный полный расклад приходит автоматически и открывает день без дополнительных действий.
+<b>Твоя доставка</b>
+{'Включена' if user['notify_enabled'] else 'Выключена'} · {pretty_time(user['notify_time'])}
+Часовой пояс · {e(user['timezone'] or DEFAULT_TIMEZONE)}
+
+Открывай расклад кнопкой ниже, даже если доставка выключена.
+Автопродления нет. Схема и разбор матрицы приобретаются отдельно.
 """
-    return f"""
-<b>🎁 Подписка</b>
-
-Ежедневный полный расклад в выбранное время.
-Срок: <b>{SUBSCRIPTION_DAYS} дней</b>
-Стоимость: <b>{SUBSCRIPTION_PRICE} токенов</b>
-
-Подписка делает ежедневный полный расклад выгоднее, чем разовые покупки.
-"""
-
-
-def admin_stats_text(users: list[dict]) -> str:
-    total_users = len(users)
-    total_tokens = sum(int(u.get("tokens") or 0) for u in users)
-    active_subs = sum(1 for u in users if subscription_active(u))
-    complete_profiles = sum(1 for u in users if profile_complete(u))
-    matrix_users = sum(1 for u in users if int(u.get("matrix_access") or 0) == 1)
-
-    return f"""
-<b>📊 Статистика проекта</b>
-
-• <b>Пользователей:</b> {total_users}
-• <b>Всего токенов:</b> {total_tokens}
-• <b>Активных подписок:</b> {active_subs}
-• <b>Полных профилей:</b> {complete_profiles}
-• <b>Купили матрицу:</b> {matrix_users}
-"""
+    return (
+        f'<b>⭐ Месяц внимания к себе</b>\n'
+        f'{SUBSCRIPTION_DAYS} дней · <b>{SUBSCRIPTION_PRICE} токенов</b>\n\n'
+        '<b>Всё для твоего дня</b>\n'
+        '💎 Полный расклад каждый день.\n'
+        '💕 Совместимость без отдельных списаний.\n'
+        '⏰ Доставка в выбранное время — включается в настройках.\n\n'
+        '<b>Почему выгоднее</b>\n'
+        f'{SUBSCRIPTION_DAYS} полных раскладов отдельно — {FULL_READING_PRICE * SUBSCRIPTION_DAYS} токенов. '
+        f'С подпиской — {SUBSCRIPTION_PRICE}: экономия <b>{FULL_READING_PRICE * SUBSCRIPTION_DAYS - SUBSCRIPTION_PRICE} токен</b>. '
+        f'Она окупается с {SUBSCRIPTION_PRICE // FULL_READING_PRICE + 1}-го дня; совместимость уже включена.\n\n'
+        'Срок начинается при подключении. <b>Без автопродления.</b>\n'
+        'Матрица и её разбор приобретаются отдельно.'
+    )
 
 
-def admin_users_text(users: list[dict], limit: int = 20) -> str:
-    active_subs = sum(1 for u in users if subscription_active(u))
-    lines = [
-        "<b>👥 Пользователи</b>",
-        "",
-        f"Всего: <b>{len(users)}</b>",
-        f"Подписок: <b>{active_subs}</b>",
-        "",
-    ]
 
-    for u in users[:limit]:
-        uid = u.get("telegram_id", "—")
-        name = u.get("name") or "не задано"
-        username = f"@{u.get('username')}" if u.get("username") else "—"
-        tokens = int(u.get("tokens") or 0)
-        sub = "⭐" if subscription_active(u) else "—"
-        lines.append(f"• <code>{e(uid)}</code> | {e(name)} | {e(username)} | 💰 {tokens} | {sub}")
 
-    if len(users) > limit:
-        lines.append("")
-        lines.append(f"… и ещё {len(users) - limit}")
-
-    return "\n".join(lines)
 
 
 async def render(target: Message | CallbackQuery, text: str, reply_markup=None) -> None:
@@ -712,21 +735,22 @@ async def prepare_subscription_if_needed(user_id: int) -> None:
         await set_notify_time(user_id, DEFAULT_NOTIFY_TIME)
 
 
-async def send_main_menu(target: Message | CallbackQuery, state: FSMContext | None = None) -> None:
+async def send_main_menu(target, state=None):
     if state:
         await state.clear()
-    text = """
-<b>🔮 Твой личный расклад на сегодня</b>
-
-Каждый день бот собирает новый сценарий на основе твоих данных и текущей даты.
-Выбирай краткий формат, если нужен быстрый ответ, или полный — если хочешь увидеть глубже.
-
-✨ Здесь тебя ждут:
-• настрой дня
-• сильная точка
-• зона риска
-• совет, который стоит взять с собой
-"""
+    user = await get_user(target.from_user.id)
+    text = (
+        f"<b>🔮 {e(get_settings().brand_name)}</b>\n"
+        "Твой день. Твои ориентиры.\n\n"
+        f"💎 Баланс: <b>{int(user['tokens'] or 0) if user else 0} токенов</b>"
+        + ("  ·  ⭐ Подписка активна" if user and subscription_active(user) else "") + "\n\n"
+        "<b>Расклады</b> — настроение дня и личный совет по дате, времени и месту рождения. "
+        "Краткий расклад — бесплатно.\n\n"
+        "<b>Матрица судьбы</b> — твои сильные стороны, сценарии и точки роста.\n\n"
+        "Выбери раздел ниже ↓"
+    )
+    if user and not profile_complete(user):
+        text += "\n\n👤 Сначала заверши профиль — раздел «Профиль»."
     await render(target, text, main_menu_keyboard(target.from_user.id))
 
 
@@ -734,16 +758,24 @@ async def send_readings_menu(target: Message | CallbackQuery, state: FSMContext 
     if state:
         await state.clear()
     user = await get_user(target.from_user.id)
-    text = """
-<b>🔮 Выбери глубину анализа</b>
+    full_access = bool(user) and (subscription_active(user) or full_unlocked_today(user, current_local_date(user)))
+    full_price = 'сегодня уже открыт' if full_access else f'{FULL_READING_PRICE} токенов на день'
+    text = f"""
+<b>🔮 Твой день в деталях</b>
 
-🌟 <b>Краткий</b> — быстрый ориентир на день.
-💎 <b>Полный</b> — отношения, дела, деньги, риск и шанс.
-🧿 <b>Личная матрица</b> — твой знак, путь, стихия и аркан.
-📅 <b>Код дня</b> — общий ритм текущей даты.
-🧮 <b>Матрица судьбы</b> — персональная карта, которую можно открыть один раз и пользоваться без ограничений.
+<b>На сегодня</b>
+🌟 Краткий расклад — карта, тема и совет. Бесплатно.
+💎 Полный расклад — отношения, работа, деньги и личные акценты; {full_price}.
 
-Выбирай то, что нужно прямо сейчас.
+<b>Познакомиться с собой</b>
+🧿 Личный портрет — знак, стихия, число пути и аркан. Бесплатно.
+📅 Код дня — общий символический фон даты. Бесплатно.
+🧮 Матрица судьбы — схема и подробный разбор по дате рождения; отдельная покупка.
+
+<b>Посмотреть на отношения</b>
+👥 Совместимость — сильные стороны пары и совет для общения.
+
+Начни с того, что тебе сейчас ближе.
 """
     await render(target, text, readings_menu_keyboard(user))
 
@@ -758,23 +790,31 @@ async def send_profile_menu(target: Message | CallbackQuery, state: FSMContext |
     await render(target, format_profile(user), profile_menu_keyboard(profile_complete(user)))
 
 
-async def send_tokens_menu(target: Message | CallbackQuery, state: FSMContext | None = None) -> None:
+async def send_tokens_menu(target, state=None):
     if state:
         await state.clear()
     user = await get_user(target.from_user.id)
-    tokens = int(user["tokens"] or 0) if user else 0
+    tokens = int(user['tokens'] or 0) if user else 0
+    text = (
+        f"<b>💎 Твой кошелёк</b>\n\nНа балансе: <b>{tokens} токенов</b>\n\n"
+        "<b>Что можно открыть</b>\n"
+        f"Расклад — {FULL_READING_PRICE} · совместимость — {MATCH_PRICE} токенов на день\n"
+        f"Подписка на {SUBSCRIPTION_DAYS} дней — {SUBSCRIPTION_PRICE} токенов\n"
+        f"Матрица: схема — {MATRIX_PRICE} · полный разбор со схемой — {MATRIX_REPORT_PRICE} токенов\n\n"
+        "<b>Выбери пакет ниже ↓</b>\n"
+        "На кнопке — количество токенов и сумма оплаты.\n"
+        "Разовое пополнение. Без автосписаний."
+    )
+    payment_settings = get_settings()
+    if not payment_settings.payment_allowed(target.from_user.id):
+        text += "\n\n<i>Пополнение скоро откроется. Пока оплату не принимаем.</i>"
+    elif payment_settings.payments_admin_only:
+        text += "\n\n<i>Закрытая проверка: пополнение доступно только администратору.</i>"
+        if payment_settings.payment_provider == 'yookassa' and not payment_settings.yookassa_test:
+            text += "\n<b>Платёж настоящий — деньги будут списаны.</b>"
     link = referral_link(target.from_user.id)
-    text = f"""
-<b>💰 Токены</b>
-
-Баланс: <b>{tokens}</b>
-
-Токены открывают полный расклад, совместимость и подписку.
-Чем выше баланс, тем свободнее можно брать глубину без пауз.
-"""
     if link:
-        text += f"\n<b>Реферальная ссылка:</b>\n{e(link)}\n"
-        text += "Поделись ссылкой и получай бонус за каждого нового пользователя."
+        text += '\n\n' + referral_explanation(link)
     await render(target, text, tokens_menu_keyboard())
 
 
@@ -788,14 +828,20 @@ async def send_schedule_menu(target: Message | CallbackQuery, state: FSMContext 
 
     enabled = bool(user["notify_enabled"]) if user["notify_enabled"] is not None else True
     text = f"""
-<b>⏰ Ежедневная рассылка</b>
+<b>⏰ Расклад в твоём ритме</b>
 
-Время рассылки: <b>{pretty_time(user['notify_time'])}</b>
-Статус: <b>{'включена' if enabled else 'выключена'}</b>
-Часовой пояс: <b>{e(user['timezone'] or DEFAULT_TIMEZONE)}</b>
+Выбери момент для себя — бот пришлёт полный расклад прямо в этот чат.
 
-Если рассылка включена, полный расклад приходит автоматически каждый день в выбранное время.
-Её можно отключить и вернуть обратно, пока активна подписка.
+<b>Твои настройки</b>
+Время · <b>{pretty_time(user['notify_time'])}</b>
+Часовой пояс · {e(user['timezone'] or DEFAULT_TIMEZONE)}
+Доставка · <b>{'включена' if enabled else 'выключена'}</b>
+Подписка · <b>{'активна' if subscription_active(user) else 'не активна'}</b>
+
+{'Для автоматической доставки оставь её включённой и задай время.' if subscription_active(user) else 'Настройки можно сохранить заранее. Автоматическая доставка начнётся после подключения подписки, если она включена и задано время.'}
+
+Отключение доставки сохраняет оплаченный доступ и не продлевает срок подписки.
+Расклад всегда можно открыть самостоятельно в разделе «Расклады».
 """
     await render(target, text, schedule_menu_keyboard(user))
 
@@ -810,15 +856,21 @@ async def send_subscription_menu(target: Message | CallbackQuery, state: FSMCont
     await render(target, format_subscription_menu_text(user), subscription_menu_keyboard(user))
 
 
-async def send_about(target: Message | CallbackQuery, state: FSMContext | None = None) -> None:
+async def send_about(target, state=None):
     if state:
         await state.clear()
-    text = """
-<b>ℹ️ О боте</b>
-
-Бот собирает дату, время и место рождения по согласию пользователя и строит дневные расклады.
-Есть короткий и полный расклад, личная матрица, код дня, совместимость, токены, подписка и матрица судьбы.
-"""
+    ai = ("Полный расклад может дополняться ИИ: он раскрывает уже рассчитанную тему, сохраняя исходные значения. "
+          if get_settings().ai_enabled else "Сейчас работает персональный алгоритм интерпретаций. ")
+    text = (
+        f"<b>✦ {e(get_settings().brand_name)}</b>\n\n"
+        "Место для ежедневной рефлексии через символы Таро, нумерологию и астрологическую традицию.\n\n"
+        "Дата, время и место рождения участвуют в персональном выборе расклада. "
+        "При одинаковом профиле в течение дня карта остаётся прежней. " + ai +
+        "\n\nМатрица рассчитывается по дате рождения: для её чисел время и город не нужны. "
+        "В схеме и разборе используются одни и те же формулы.\n\n"
+        "Символические интерпретации не предсказывают неизбежные события и не заменяют решения специалиста.\n\n"
+        "/terms — условия · /privacy — данные · /paysupport — поддержка"
+    )
     await render(target, text, main_menu_keyboard(target.from_user.id))
 
 
@@ -835,140 +887,73 @@ def match_prompt_keyboard() -> InlineKeyboardMarkup:
 
 
 def matrix_access_active(user) -> bool:
-    return bool(user and int(user["matrix_access"] or 0) == 1)
+    return bool(user and user.get('_matrix_unlocked', False))
 
 
 def matrix_menu_keyboard(user) -> InlineKeyboardMarkup:
+    rows = []
     if matrix_access_active(user):
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🧮 Открыть матрицу", callback_data="matrix:open")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:main")],
-            ]
-        )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=f"💎 Открыть матрицу • {MATRIX_PRICE}", callback_data="matrix:buy_prompt")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:main")],
-        ]
-    )
+        rows.append([InlineKeyboardButton(text="✦ Открыть схему", callback_data="matrix:open", style='primary')])
+        rows.append([InlineKeyboardButton(text="Скачать PNG без сжатия", callback_data="matrix:download")])
+    else:
+        rows.append([InlineKeyboardButton(text=f"Схема · {MATRIX_PRICE} токенов", callback_data="matrix:buy_prompt")])
+    report_open = bool(user and user.get('_report_unlocked'))
+    rows.append([InlineKeyboardButton(
+        text="Читать мой разбор" if report_open else f"Полный разбор · {MATRIX_REPORT_PRICE} токенов",
+        callback_data="matrix:report:open" if report_open else "matrix:report:prompt", style='primary')])
+    rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def format_matrix_preview(user) -> str:
-    if not user or not user["birth_date"]:
-        return """<b>🧮 Матрица судьбы</b>
-
-Сначала заполни дату рождения."""
-
-    matrix = matrix_of_destiny(user["birth_date"])
-    return f"""
-<b>🧮 Матрица судьбы</b>
-
-• <b>Личный аркан:</b> {e(matrix['labels']['personal'])}
-• <b>Личное ядро:</b> {e(matrix['labels']['result'])}
-• <b>День:</b> {e(matrix['labels']['day'])}
-• <b>Месяц:</b> {e(matrix['labels']['month'])}
-• <b>Год:</b> {e(matrix['labels']['year'])}
-
-Полная матрица покажет каналы денег, отношений, талантов и кармическую связку.
-
-<i>Открыть полный доступ можно за {MATRIX_PRICE} токенов — один раз, навсегда.</i>
-"""
+    if not user or not user['birth_date']:
+        return '<b>✦ Матрица судьбы</b>\n\nСначала заполни дату рождения.'
+    matrix = calc_matrix(user['birth_date'])
+    return (
+        f"<b>✦ Матрица судьбы · {pretty_date(user['birth_date'])}</b>\n\n"
+        f"Личность · <b>{matrix['A']} — {e(MATRIX_ARCANA[matrix['A']])}</b>\n"
+        f"Таланты · <b>{matrix['B']} — {e(MATRIX_ARCANA[matrix['B']])}</b>\n"
+        f"Внутренняя опора · <b>{matrix['E']} — {e(MATRIX_ARCANA[matrix['E']])}</b>\n\n"
+        "<b>Схема</b> — 30 точек, родовые диагонали, линии отношений и реализации, направления и таблица ресурсов.\n\n"
+        "<b>Полный разбор</b> — объяснение каждой позиции: сильные стороны, возможные трудности и конкретные шаги. "
+        "Схема входит в разбор. Его можно читать по разделам и скачать целиком.\n\n"
+        "Повторное открытие купленного материала для этой даты рождения бесплатно."
+    )
 
 
 def format_matrix_buy_prompt(user) -> str:
-    tokens = int(user["tokens"] or 0)
-    return f"""
-<b>🧮 Матрица судьбы</b>
-
-Это персональная схема по дате рождения: ядро, денежный канал, линия отношений, таланты и кармическая задача.
-
-После открытия ты сможешь возвращаться к ней без повторной оплаты.
-
-• <b>Разовый доступ:</b> {MATRIX_PRICE} токенов
-• <b>Баланс:</b> {tokens}
-
-Это одна из самых сильных функций для длительного удержания: человек возвращается к ней снова и снова.
-"""
+    return (
+        f"<b>Твоя схема матрицы</b>\n\nДата: {pretty_date(user['birth_date'])}\n"
+        f"Стоимость: <b>{MATRIX_PRICE} токенов</b>\nБаланс: <b>{user['tokens']}</b>\n\n"
+        "Чёткая схема, подписи позиций и легенда. Можно скачать PNG в полном качестве. "
+        "Повторное открытие для этой даты рождения — без оплаты.\n\n"
+        f"Подробный текстовый разбор продаётся отдельно за {MATRIX_REPORT_PRICE} токенов и уже включает схему."
+    )
 
 
 # ---------------------------
 # Matrix send helper
 # ---------------------------
 
-async def send_matrix_menu(target: Message | CallbackQuery, state: FSMContext | None = None) -> None:
+async def send_matrix_menu(target, state=None):
     if state:
         await state.clear()
-    user = await get_user(target.from_user.id)
-    if not user:
-        await render(target, "Сначала нажми /start.", main_menu_keyboard(target.from_user.id))
+    user = await load_matrix_user(target.from_user.id)
+    if not user or not user['birth_date']:
+        await render(target, 'Сначала заполни дату рождения в профиле.', main_menu_keyboard(target.from_user.id))
         return
-
-    if not user["birth_date"]:
-        await render(
-            target,
-            "<b>🧮 Матрица судьбы</b>\n\nСначала нужно заполнить дату рождения.",
-            main_menu_keyboard(target.from_user.id),
-        )
-        return
-
     if matrix_access_active(user):
-        # Генерируем красивую картинку
-        image_path = build_matrix_image(user)
-        caption = (
-            f"<b>🧮 Матрица судьбы</b>\n"
-            f"<b>{e(user.get('name', ''))}</b> • {pretty_date(user['birth_date'])}\n\n"
-            f"Твоя персональная карта по методу Натальи Ладини.\n"
-            f"Числа рассчитаны на основе даты рождения."
-        )
-        if image_path:
-            try:
-                if isinstance(target, CallbackQuery):
-                    await target.message.answer_photo(
-                        FSInputFile(image_path),
-                        caption=caption,
-                        reply_markup=matrix_menu_keyboard(user),
-                    )
-                else:
-                    await target.answer_photo(
-                        FSInputFile(image_path),
-                        caption=caption,
-                        reply_markup=matrix_menu_keyboard(user),
-                    )
-                return
-            except Exception as err:
-                logging.exception("Ошибка отправки картинки матрицы: %s", err)
-
-        # Fallback — текст если картинка не вышла
-        await render(target, caption, matrix_menu_keyboard(user))
-        return
-
-    await render(target, format_matrix_preview(user), matrix_menu_keyboard(user))
+        await deliver_matrix(target, user)
+    else:
+        await render(target, format_matrix_preview(user), matrix_menu_keyboard(user))
 
 
 # ---------------------------
 # Admin helpers
 # ---------------------------
 
-async def send_admin_panel(target: Message | CallbackQuery, state: FSMContext | None = None) -> None:
-    if state:
-        await state.clear()
-    if not is_admin(target.from_user.id):
-        await render(target, "⛔ Доступ запрещён.", main_menu_keyboard(target.from_user.id))
-        return
-    await render(
-        target,
-        "<b>⚙️ Админ-панель</b>\n\nСтатистика, токены, пользователи и рассылка — всё здесь.",
-        admin_menu_keyboard(),
-    )
 
 
-async def get_admin_users() -> list[dict]:
-    async with aiosqlite.connect("users.db") as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users ORDER BY telegram_id DESC") as cursor:
-            rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
 
 
 # ---------------------------
@@ -991,8 +976,8 @@ async def cmd_start(message: Message, state: FSMContext):
     if created and referrer_id:
         referrer = await get_user(referrer_id)
         if referrer:
-            await add_tokens(message.from_user.id, 10)
-            await add_tokens(referrer_id, 5)
+            await add_tokens(message.from_user.id, REFERRAL_FRIEND_BONUS)
+            await add_tokens(referrer_id, REFERRER_BONUS)
 
     user = await get_user(message.from_user.id)
 
@@ -1062,10 +1047,6 @@ async def cmd_about(message: Message, state: FSMContext):
     await send_about(message, state)
 
 
-@router.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext):
-    await upsert_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
-    await send_admin_panel(message, state)
 
 
 @router.message(Command("cancel"))
@@ -1079,6 +1060,23 @@ async def cmd_cancel(message: Message, state: FSMContext):
 async def menu_button(message: Message, state: FSMContext):
     await upsert_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
     await send_main_menu(message, state)
+
+
+@router.message(F.text == "🔮 Мой расклад")
+async def quick_readings(message: Message, state: FSMContext):
+    await upsert_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    await send_readings_menu(message, state)
+
+
+@router.message(F.text == "✦ Матрица судьбы")
+async def quick_matrix(message: Message, state: FSMContext):
+    await upsert_user(message.from_user.id, message.from_user.full_name, message.from_user.username)
+    await send_matrix_menu(message, state)
+
+
+@router.message(F.text == "💳 Пополнить токены")
+async def quick_tokens(message: Message, state: FSMContext):
+    await cmd_balance(message, state)
 
 
 # ---------------------------
@@ -1139,16 +1137,8 @@ async def menu_matrix(callback: CallbackQuery, state: FSMContext):
     await send_matrix_menu(callback, state)
 
 
-@router.callback_query(F.data == "admin:panel")
-async def admin_panel(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await send_admin_panel(callback, state)
 
 
-@router.callback_query(F.data == "admin_menu")
-async def admin_panel_legacy(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await send_admin_panel(callback, state)
 
 
 # ---------------------------
@@ -1177,21 +1167,23 @@ async def back_handler(callback: CallbackQuery, state: FSMContext):
         await prompt_match(callback, state)
     elif target == "birth_year":
         await state.clear()
-        await start_profile_flow(callback.message, state, user)
+        await start_profile_flow(callback, state, user)
     elif target == "birth_month":
         await state.set_state(Onboarding.birth_year)
         await render(callback, "Выбери год рождения:", year_keyboard())
         return
     elif target == "birth_day":
         data = await state.get_data()
-        year = int(data.get("birth_year"))
+        year = int(data.get("birth_year") or (user["birth_date"] or "2000").split("-")[0])
+        await state.update_data(birth_year=year)
         await state.set_state(Onboarding.birth_month)
         await render(callback, "Выбери месяц рождения:", month_keyboard())
         return
     elif target == "birth_hour":
         data = await state.get_data()
-        year = int(data.get("birth_year"))
-        month = int(data.get("birth_month"))
+        year = int(data.get("birth_year") or (user["birth_date"] or "2000").split("-")[0])
+        month = int(data.get("birth_month") or (user["birth_date"] or "2000-01").split("-")[1])
+        await state.update_data(birth_year=year, birth_month=month)
         await state.set_state(Onboarding.birth_day)
         await render(callback, f"Год: {year}\nМесяц: {month:02d}\n\nВыбери день:", days_keyboard(year, month))
         return
@@ -1201,11 +1193,11 @@ async def back_handler(callback: CallbackQuery, state: FSMContext):
         return
     elif target == "schedule_hour":
         await state.set_state(ScheduleSetup.hour)
-        await render(callback, "Выбери час рассылки:", hours_keyboard("schedule_hour", "back:schedule"))
+        await render(callback, "<b>⏰ В какое время прислать расклад?</b>\n\nВыбери час в своём часовом поясе.", hours_keyboard("schedule_hour", "back:schedule"))
         return
     elif target == "schedule_minute":
         await state.set_state(ScheduleSetup.minute)
-        await render(callback, "Выбери минуты рассылки:", minutes_keyboard("schedule_minute", "back:schedule_hour"))
+        await render(callback, "<b>⏰ Осталось выбрать минуты</b>", minutes_keyboard("schedule_minute", "back:schedule_hour"))
         return
     elif target == "full_pay":
         await send_readings_menu(callback, state)
@@ -1237,7 +1229,7 @@ async def profile_show(callback: CallbackQuery):
 async def profile_continue(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     user = await get_user(callback.from_user.id)
-    await start_profile_flow(callback.message, state, user)
+    await start_profile_flow(callback, state, user)
 
 
 @router.callback_query(F.data == "profile:reset")
@@ -1255,7 +1247,7 @@ async def profile_reset_yes(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await reset_profile(callback.from_user.id)
     user = await get_user(callback.from_user.id)
-    await start_profile_flow(callback.message, state, user)
+    await start_profile_flow(callback, state, user)
 
 
 # ---------------------------
@@ -1270,31 +1262,10 @@ async def tokens_balance(callback: CallbackQuery):
     link = referral_link(callback.from_user.id)
     text = f"<b>💰 Баланс:</b> {tokens}\n"
     if link:
-        text += f"\n<b>Реферальная ссылка:</b>\n{e(link)}"
+        text += '\n' + referral_explanation(link)
     await render(callback, text, tokens_menu_keyboard())
 
 
-@router.callback_query(F.data.startswith("tokens:buy:"))
-async def tokens_buy(callback: CallbackQuery):
-    await callback.answer()
-    amount_text = callback.data.split(":")[-1]
-    try:
-        amount = int(amount_text)
-    except ValueError:
-        amount = 0
-
-    if amount <= 0:
-        await render(callback, "Не удалось определить количество токенов.", tokens_menu_keyboard())
-        return
-
-    await add_tokens(callback.from_user.id, amount)
-    user = await get_user(callback.from_user.id)
-    total = int(user["tokens"] or 0) if user else amount
-    await render(
-        callback,
-        f"<b>✅ Пакет активирован</b>\n\n• Добавлено: <b>{amount}</b>\n• Баланс: <b>{total}</b>\n\nТеперь у тебя больше свободы для раскладов и подписки.",
-        tokens_menu_keyboard(),
-    )
 
 
 # ---------------------------
@@ -1316,18 +1287,24 @@ async def schedule_time_info(callback: CallbackQuery):
 async def schedule_set_time(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(ScheduleSetup.hour)
-    await render(callback, "<b>Выбери час рассылки:</b>", hours_keyboard("schedule_hour", "back:schedule"))
+    await render(callback, "<b>⏰ В какое время прислать расклад?</b>\n\nВыбери час в своём часовом поясе.", hours_keyboard("schedule_hour", "back:schedule"))
 
 
 @router.callback_query(ScheduleSetup.hour, F.data.startswith("schedule_hour:"))
 async def schedule_hour(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    hour = int(callback.data.split(":", 1)[1])
+    try:
+        hour = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Кнопка устарела.', show_alert=True)
+        return
+    if not 0 <= hour <= 23:
+        return
     await state.update_data(schedule_hour=hour)
     await state.set_state(ScheduleSetup.minute)
     await render(
         callback,
-        f"<b>Час рассылки:</b> {hour:02d}\n\nВыбери минуты:",
+        f"<b>⏰ Время доставки · {hour:02d}:…</b>\n\nТеперь выбери минуты.",
         minutes_keyboard("schedule_minute", "back:schedule_hour"),
     )
 
@@ -1335,8 +1312,18 @@ async def schedule_hour(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(ScheduleSetup.minute, F.data.startswith("schedule_minute:"))
 async def schedule_minute(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    minute = int(callback.data.split(":", 1)[1])
+    try:
+        minute = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Кнопка устарела.', show_alert=True)
+        return
+    if not 0 <= minute <= 59:
+        return
     data = await state.get_data()
+    if data.get('schedule_hour') is None:
+        await state.set_state(ScheduleSetup.hour)
+        await render(callback, 'Сначала выбери час доставки.', hours_keyboard('schedule_hour', 'back:schedule'))
+        return
     hour = int(data["schedule_hour"])
     notify_time = f"{hour:02d}:{minute:02d}"
 
@@ -1346,7 +1333,9 @@ async def schedule_minute(callback: CallbackQuery, state: FSMContext):
     user = await get_user(callback.from_user.id)
     await render(
         callback,
-        f"<b>✅ Время сохранено</b>\n\n• Рассылка: <b>{notify_time}</b>",
+        f"<b>✅ Время сохранено · {notify_time}</b>\n\n"
+        f"Часовой пояс · {e(user['timezone'] or DEFAULT_TIMEZONE)}\n\n"
+        "Расклад придёт в это время при активной подписке и включённой доставке.",
         schedule_menu_keyboard(user),
     )
 
@@ -1360,10 +1349,10 @@ async def schedule_disable_prompt(callback: CallbackQuery):
         return
 
     text = (
-        "<b>Отключить ежедневную рассылку?</b>\n\n"
-        "Полный расклад перестанет приходить автоматически.\n"
-        "Средства не возвращаются.\n"
-        "Рассылку можно включить обратно в любой момент, пока действует подписка."
+        "<b>⏸ Отключить доставку?</b>\n\n"
+        "Ежедневный расклад перестанет приходить автоматически. "
+        "Ты сможешь открывать его самостоятельно, пока действует подписка.\n\n"
+        "Оплаченный срок продолжит идти. Вернуть доставку можно в этих же настройках."
     )
     await render(
         callback,
@@ -1379,7 +1368,8 @@ async def schedule_disable(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
     await render(
         callback,
-        "<b>Ежедневная рассылка отключена.</b>\n\nТы можешь включить её обратно в любой момент, пока активна подписка.",
+        "<b>⏸ Доставка отключена</b>\n\nОплаченный доступ сохранён до конца срока. "
+        "Расклад можно открыть в меню, а доставку — включить снова здесь.",
         schedule_menu_keyboard(user),
     )
 
@@ -1391,7 +1381,8 @@ async def schedule_enable(callback: CallbackQuery):
     user = await get_user(callback.from_user.id)
     await render(
         callback,
-        "<b>Ежедневная рассылка включена.</b>\n\nПолный расклад снова будет приходить автоматически.",
+        "<b>✅ Доставка включена</b>\n\nРасклад будет приходить в выбранное время "
+        "при активной подписке. Проверь время и часовой пояс в настройках.",
         schedule_menu_keyboard(user),
     )
 
@@ -1407,7 +1398,7 @@ async def sub_buy_prompt(callback: CallbackQuery):
     await render(
         callback,
         format_subscription_prompt(user),
-        confirm_keyboard("sub:buy", "back:subscription", "✅ Оформить"),
+        confirm_keyboard("sub:buy", "back:subscription", f"✅ Подключить за {SUBSCRIPTION_PRICE} токенов"),
     )
 
 
@@ -1415,66 +1406,35 @@ async def sub_buy_prompt(callback: CallbackQuery):
 async def sub_buy(callback: CallbackQuery):
     await callback.answer()
     user = await get_user(callback.from_user.id)
-    if not user:
-        await render(callback, "Сначала нажми /start.", main_menu_keyboard(callback.from_user.id))
+    if not user or not profile_complete(user):
+        await render(callback, 'Сначала заполни профиль — он нужен для ежедневных раскладов.', main_menu_keyboard(callback.from_user.id))
         return
-
-    if not await spend_tokens(callback.from_user.id, SUBSCRIPTION_PRICE):
-        tokens = int(user["tokens"] or 0)
-        await render(
-            callback,
-            f"<b>Недостаточно токенов.</b>\n\nБаланс: <b>{tokens}</b>\nНужно: <b>{SUBSCRIPTION_PRICE}</b>\n\nОткрой баланс и вернись к подписке, когда будешь готов.",
-            tokens_menu_keyboard(),
-        )
+    result = await commerce.purchase_product(callback.from_user.id, 'subscription')
+    if result.status == 'insufficient':
+        await render(callback,
+            f'<b>⭐ До подписки один шаг</b>\n\n'
+            f'Стоимость · {SUBSCRIPTION_PRICE} токенов\nБаланс · {result.balance} токенов\n'
+            f'Не хватает · {SUBSCRIPTION_PRICE - result.balance} токенов\n\n'
+            'Пополни баланс и вернись в раздел «Подписка». Подключение нужно будет подтвердить отдельно.',
+            tokens_menu_keyboard())
         return
-
     await prepare_subscription_if_needed(callback.from_user.id)
-    until = datetime.now(timezone.utc) + timedelta(days=SUBSCRIPTION_DAYS)
-    await set_subscription_until(callback.from_user.id, until.isoformat())
-
     user = await get_user(callback.from_user.id)
-    await render(
-        callback,
-        f"<b>🎁 Подписка активна</b>\n\nДо: <b>{pretty_iso_dt(user['subscription_until'])}</b>\n"
-        f"Время рассылки: <b>{pretty_time(user['notify_time'])}</b>",
-        subscription_menu_keyboard(user),
-    )
+    await render(callback,
+        format_subscription_menu_text(user), subscription_menu_keyboard(user))
 
 
 @router.callback_query(F.data == "sub:cancel_prompt")
 async def sub_cancel_prompt(callback: CallbackQuery):
     await callback.answer()
-    user = await get_user(callback.from_user.id)
-    if not subscription_active(user):
-        await render(callback, """<b>Подписка уже не активна.</b>
-
-Оформить новую можно в любой момент.""", subscription_menu_keyboard(user))
-        return
-
-    await render(
-        callback,
-        """<b>Отменить подписку?</b>
-
-Доступ к ежедневному полному раскладу прекратится сразу.
-Средства не возвращаются.
-Если захочешь вернуться, оформить новую можно в любой момент.""",
-        confirm_keyboard("sub:cancel", "back:subscription", "✅ Отменить"),
-    )
+    await render(callback, 'У подписки нет автопродления. Можно отключить ежедневную доставку: оплаченный доступ сохранится до конца срока.', confirm_keyboard('sub:cancel', 'menu:subscription', 'Отключить доставку'))
 
 
 @router.callback_query(F.data == "sub:cancel")
 async def sub_cancel(callback: CallbackQuery):
     await callback.answer()
-    await set_subscription_until(callback.from_user.id, None)
     await set_notify_enabled(callback.from_user.id, False)
-    user = await get_user(callback.from_user.id)
-    await render(
-        callback,
-        """<b>Подписка отменена.</b>
-
-Средства не возвращаются. Оформить новую можно в любой момент.""",
-        subscription_menu_keyboard(user),
-    )
+    await render(callback, 'Доставка отключена. Оплаченный доступ сохранён до конца срока. Автосписаний нет.', subscription_menu_keyboard(await get_user(callback.from_user.id)))
 
 
 # ---------------------------
@@ -1528,7 +1488,7 @@ async def reading_full(callback: CallbackQuery):
 
     local_date = current_local_date(user)
     if subscription_active(user) or full_unlocked_today(user, local_date):
-        reading = generate_daily_reading(user, local_date)
+        reading = await get_daily_reading(user, local_date)
         await render(callback, format_full_reading(reading, local_date), readings_menu_keyboard(user))
         return
 
@@ -1541,7 +1501,7 @@ async def reading_full(callback: CallbackQuery):
                     InlineKeyboardButton(text=f"💎 Открыть полный расклад • {FULL_READING_PRICE}", callback_data="reading:full_pay"),
                 ],
                 [
-                    InlineKeyboardButton(text=f"⭐ Подписка выгоднее • {SUBSCRIPTION_PRICE}", callback_data="menu:subscription"),
+                    InlineKeyboardButton(text=f"⭐ На {SUBSCRIPTION_DAYS} дней · {SUBSCRIPTION_PRICE} токенов", callback_data="menu:subscription"),
                 ],
                 [
                     InlineKeyboardButton(text="⬅️ Назад", callback_data="back:readings"),
@@ -1556,32 +1516,19 @@ async def reading_full_pay(callback: CallbackQuery):
     await callback.answer()
     user = await get_user(callback.from_user.id)
     if not user or not profile_complete(user):
-        await render(callback, "Сначала заполни профиль.", main_menu_keyboard(callback.from_user.id))
+        await render(callback, 'Сначала заполни профиль.', main_menu_keyboard(callback.from_user.id))
         return
-
     local_date = current_local_date(user)
-
-    if subscription_active(user) or full_unlocked_today(user, local_date):
-        reading = generate_daily_reading(user, local_date)
-        await render(callback, format_full_reading(reading, local_date), readings_menu_keyboard(user))
+    owned = subscription_active(user) or full_unlocked_today(user, local_date) or await commerce.has_entitlement(callback.from_user.id, 'full_reading', local_date.isoformat())
+    if not owned and int(user['tokens'] or 0) < FULL_READING_PRICE:
+        await render(callback, f'Нужно {FULL_READING_PRICE} токенов. Баланс: {user["tokens"]}.', tokens_menu_keyboard())
         return
-
-    if not await spend_tokens(callback.from_user.id, FULL_READING_PRICE):
-        tokens = int(user["tokens"] or 0)
-        await render(
-            callback,
-            f"<b>Недостаточно токенов.</b>\n\nБаланс: <b>{tokens}</b>\nНужно: <b>{FULL_READING_PRICE}</b>\n\nЕсли берёшь полный расклад регулярно, подписка за 199 токенов обычно выгоднее.",
-            tokens_menu_keyboard(),
-        )
+    reading = await get_daily_reading(user, local_date)
+    result = await commerce.purchase_product(callback.from_user.id, 'full_reading', local_date.isoformat())
+    if result.status == 'insufficient':
+        await render(callback, f'Нужно {FULL_READING_PRICE} токенов. Баланс: {result.balance}.', tokens_menu_keyboard())
         return
-
-    await set_paid_full_date(callback.from_user.id, local_date.isoformat())
-    reading = generate_daily_reading(user, local_date)
-    await render(
-        callback,
-        format_full_reading(reading, local_date),
-        readings_menu_keyboard(await get_user(callback.from_user.id)),
-    )
+    await render(callback, format_full_reading(reading, local_date), readings_menu_keyboard(await get_user(callback.from_user.id)))
 
 
 # ---------------------------
@@ -1591,48 +1538,32 @@ async def reading_full_pay(callback: CallbackQuery):
 @router.callback_query(F.data == "matrix:buy_prompt")
 async def matrix_buy_prompt(callback: CallbackQuery):
     await callback.answer()
-    user = await get_user(callback.from_user.id)
-    if not user:
-        await render(callback, "Сначала нажми /start.", main_menu_keyboard(callback.from_user.id))
-        return
-    if not user["birth_date"]:
-        await render(callback, "Сначала заполни дату рождения.", main_menu_keyboard(callback.from_user.id))
-        return
-    if matrix_access_active(user):
-        await send_matrix_menu(callback, None)
-        return
-
-    await render(
-        callback,
-        format_matrix_buy_prompt(user),
-        confirm_keyboard("matrix:buy", "back:main", "✅ Открыть матрицу"),
-    )
+    user = await load_matrix_user(callback.from_user.id)
+    if not user or not user['birth_date']:
+        await render(callback, 'Сначала заполни дату рождения.', main_menu_keyboard(callback.from_user.id))
+    elif matrix_access_active(user):
+        await deliver_matrix(callback, user)
+    else:
+        await render(callback, format_matrix_buy_prompt(user), confirm_keyboard('matrix:buy:' + user['birth_date'], 'menu:matrix', f'Купить за {MATRIX_PRICE} токенов'))
 
 
-@router.callback_query(F.data == "matrix:buy")
+@router.callback_query(F.data.startswith("matrix:buy:"))
 async def matrix_buy(callback: CallbackQuery):
     await callback.answer()
-    user = await get_user(callback.from_user.id)
-    if not user or not user["birth_date"]:
-        await render(callback, "Сначала заполни дату рождения.", main_menu_keyboard(callback.from_user.id))
+    user = await load_matrix_user(callback.from_user.id)
+    if not user or not user['birth_date']:
+        await render(callback, 'Сначала заполни дату рождения.', main_menu_keyboard(callback.from_user.id))
         return
-
+    if callback.data.rsplit(':', 1)[-1] != user['birth_date']:
+        await render(callback, 'Дата в профиле изменилась. Открой актуальное предложение.', matrix_menu_keyboard(user))
+        return
     if matrix_access_active(user):
-        await send_matrix_menu(callback, None)
+        await deliver_matrix(callback, user)
         return
-
-    if not await spend_tokens(callback.from_user.id, MATRIX_PRICE):
-        tokens = int(user["tokens"] or 0)
-        await render(
-            callback,
-            f"<b>Недостаточно токенов.</b>\n\nБаланс: <b>{tokens}</b>\nНужно: <b>{MATRIX_PRICE}</b>\n\nМатрица открывается один раз и остаётся доступной навсегда.",
-            tokens_menu_keyboard(),
-        )
+    if user['tokens'] < MATRIX_PRICE:
+        await render(callback, f'Для схемы нужно {MATRIX_PRICE} токенов. Баланс: {user["tokens"]}.', tokens_menu_keyboard())
         return
-
-    await set_matrix_access(callback.from_user.id, True)
-    await set_matrix_paid_at(callback.from_user.id, datetime.now(timezone.utc).isoformat())
-    await send_matrix_menu(callback, None)
+    await deliver_matrix(callback, user, purchase=True)
 
 
 @router.callback_query(F.data == "matrix:open")
@@ -1645,138 +1576,26 @@ async def matrix_open(callback: CallbackQuery):
 # Admin callbacks
 # ---------------------------
 
-@router.callback_query(F.data == "admin:stats")
-async def admin_stats(callback: CallbackQuery):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await render(callback, "⛔ Доступ запрещён.", main_menu_keyboard(callback.from_user.id))
-        return
-
-    users = await get_admin_users()
-    await render(callback, admin_stats_text(users), admin_menu_keyboard())
 
 
-@router.callback_query(F.data == "admin_stats")
-async def admin_stats_legacy(callback: CallbackQuery):
-    await admin_stats(callback)
 
 
-@router.callback_query(F.data == "admin:users")
-async def admin_users(callback: CallbackQuery):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await render(callback, "⛔ Доступ запрещён.", main_menu_keyboard(callback.from_user.id))
-        return
-
-    users = await get_admin_users()
-    await render(callback, admin_users_text(users), admin_menu_keyboard())
 
 
-@router.callback_query(F.data == "admin_users")
-async def admin_users_legacy(callback: CallbackQuery):
-    await admin_users(callback)
 
 
-@router.callback_query(F.data == "admin:give_tokens")
-async def admin_give_tokens(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await render(callback, "⛔ Доступ запрещён.", main_menu_keyboard(callback.from_user.id))
-        return
-
-    await state.set_state(AdminStates.waiting_for_user_id)
-    await render(callback, "Введите <b>ID пользователя</b>:", admin_menu_keyboard())
 
 
-@router.callback_query(F.data == "admin_give_tokens")
-async def admin_give_tokens_legacy(callback: CallbackQuery, state: FSMContext):
-    await admin_give_tokens(callback, state)
 
 
-@router.message(AdminStates.waiting_for_user_id)
-async def admin_receive_user_id(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-
-    raw = (message.text or "").strip()
-    try:
-        user_id = int(raw)
-    except ValueError:
-        await message.answer("Нужен числовой ID пользователя.")
-        return
-
-    await state.update_data(user_id=user_id)
-    await state.set_state(AdminStates.waiting_for_tokens)
-    await message.answer("Сколько токенов начислить?")
 
 
-@router.message(AdminStates.waiting_for_tokens)
-async def admin_receive_tokens(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-
-    data = await state.get_data()
-    user_id = data.get("user_id")
-
-    raw = (message.text or "").strip()
-    try:
-        tokens = int(raw)
-    except ValueError:
-        await message.answer("Нужна числовая сумма токенов.")
-        return
-
-    user = await get_user(user_id)
-    if not user:
-        await message.answer("❌ Пользователь не найден")
-        await state.clear()
-        return
-
-    await add_tokens(user_id, tokens)
-    await message.answer(f"✅ Начислено {tokens} токенов пользователю <code>{user_id}</code>", parse_mode=ParseMode.HTML)
-    await state.clear()
 
 
-@router.callback_query(F.data == "admin:broadcast")
-async def admin_broadcast(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await render(callback, "⛔ Доступ запрещён.", main_menu_keyboard(callback.from_user.id))
-        return
-
-    await state.set_state(AdminStates.waiting_for_broadcast)
-    await render(callback, "Введите текст <b>рассылки</b>:", admin_menu_keyboard())
 
 
-@router.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast_legacy(callback: CallbackQuery, state: FSMContext):
-    await admin_broadcast(callback, state)
 
 
-@router.message(AdminStates.waiting_for_broadcast)
-async def admin_send_broadcast(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-
-    users = await get_admin_users()
-    success = 0
-    failed = 0
-    broadcast_text = message.html_text or message.text or ""
-
-    for user in users:
-        uid = user.get("telegram_id")
-        if uid is None:
-            continue
-        try:
-            await bot.send_message(chat_id=uid, text=broadcast_text, parse_mode=ParseMode.HTML)
-            success += 1
-        except Exception:
-            failed += 1
-
-    await message.answer(f"✅ Отправлено: {success}\n❌ Ошибки: {failed}")
-    await state.clear()
 
 
 # ---------------------------
@@ -1794,9 +1613,14 @@ async def prompt_match(target: Message | CallbackQuery, state: FSMContext) -> No
 
     await state.set_state(Onboarding.match_username)
     text = (
-        "<b>👥 Совместимость</b>\n\n"
-        "Отправь <b>@username</b> второго пользователя, который уже зарегистрирован в боте.\n\n"
-        "Ты увидишь, как складывается ваша связка сегодня: где притяжение, где риск и как лучше говорить друг с другом."
+        "<b>👥 На одной волне</b>\n\n"
+        "Что вас сближает сегодня? Посмотри на сильные стороны пары, возможные разногласия "
+        "и подсказки для тёплого общения.\n\n"
+        "<b>Как начать</b>\n"
+        "Отправь Telegram-имя партнёра в формате <b>@username</b>. "
+        "Вы оба должны быть зарегистрированы в боте и заполнить данные рождения.\n\n"
+        + ("⭐ Включено в твою подписку." if subscription_active(user)
+           else f"Доступ на день · {MATCH_PRICE} токенов. В подписку уже включён.")
     )
     await render(target, text, match_prompt_keyboard())
 
@@ -1824,8 +1648,7 @@ async def match_username(message: Message, state: FSMContext):
 
 Отправь ему свою реферальную ссылку:"""
         if link:
-            text += f"\n\n{e(link)}\n"
-            text += "За регистрацию по ссылке начисляются токены."
+            text += '\n\n' + referral_explanation(link)
         await state.clear()
         await message.answer(text, reply_markup=main_menu_keyboard(message.from_user.id))
         return
@@ -1860,7 +1683,10 @@ async def match_username(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("match:pay:"))
 async def match_pay(callback: CallbackQuery):
     await callback.answer()
-    other_id = int(callback.data.split(":")[-1])
+    try:
+        other_id = int(callback.data.split(":")[-1])
+    except ValueError:
+        return
 
     user = await get_user(callback.from_user.id)
     other = await get_user(other_id)
@@ -1879,7 +1705,8 @@ async def match_pay(callback: CallbackQuery):
         await render(callback, format_match_result(user, other, pair, local_date, other["username"] or str(other_id)), main_menu_keyboard(callback.from_user.id))
         return
 
-    if not await spend_tokens(callback.from_user.id, MATCH_PRICE):
+    result = await commerce.purchase_product(callback.from_user.id, 'match', local_date.isoformat())
+    if result.status == 'insufficient':
         tokens = int(user["tokens"] or 0)
         await render(
             callback,
@@ -1893,7 +1720,6 @@ async def match_pay(callback: CallbackQuery):
         )
         return
 
-    await set_paid_match_date(callback.from_user.id, local_date.isoformat())
     pair = generate_pair_reading(user, other, local_date)
     await render(
         callback,
@@ -1907,6 +1733,19 @@ async def match_pay(callback: CallbackQuery):
 # ---------------------------
 
 async def start_profile_flow(target: Message | CallbackQuery, state: FSMContext, user) -> None:
+    if not user:
+        await render(target, 'Начни с /start.', main_menu_keyboard(target.from_user.id))
+        return
+    if not await has_consent(target.from_user.id):
+        await state.clear()
+        await render(target,
+            '<b>Соберём твой профиль</b>\n\nПонадобятся дата, время и город рождения. '
+            'Они сохраняются для персональных раскладов. Данные можно сбросить в профиле. '
+            'Уведомления настраиваются отдельно.\n\n'
+            '/privacy — обработка данных · /terms — условия\n\n'
+            'Нажимая «Согласен», ты соглашаешься на обработку этих данных для работы сервиса.',
+            one_row_buttons(('Согласен · заполнить профиль', 'profile:consent'), back_cb='back:main'))
+        return
     if not user["birth_date"]:
         await state.set_state(Onboarding.birth_year)
         await render(target, "<b>Выбери год рождения:</b>", year_keyboard())
@@ -1933,7 +1772,13 @@ async def start_profile_flow(target: Message | CallbackQuery, state: FSMContext,
 @router.callback_query(Onboarding.birth_year, F.data.startswith("birth_year:"))
 async def birth_year(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    year = int(callback.data.split(":", 1)[1])
+    try:
+        year = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Кнопка устарела.', show_alert=True)
+        return
+    if not 1900 <= year <= date_cls.today().year:
+        return
     await state.update_data(birth_year=year)
     await state.set_state(Onboarding.birth_month)
     await render(callback, "<b>Выбери месяц рождения:</b>", month_keyboard())
@@ -1942,7 +1787,13 @@ async def birth_year(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(Onboarding.birth_month, F.data.startswith("birth_month:"))
 async def birth_month(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    month = int(callback.data.split(":", 1)[1])
+    try:
+        month = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Кнопка устарела.', show_alert=True)
+        return
+    if not 1 <= month <= 12:
+        return
     await state.update_data(birth_month=month)
     data = await state.get_data()
     year = int(data["birth_year"])
@@ -1953,7 +1804,11 @@ async def birth_month(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(Onboarding.birth_day, F.data.startswith("birth_day:"))
 async def birth_day(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    day = int(callback.data.split(":", 1)[1])
+    try:
+        day = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Кнопка устарела.', show_alert=True)
+        return
     data = await state.get_data()
     year = int(data["birth_year"])
     month = int(data["birth_month"])
@@ -1964,6 +1819,9 @@ async def birth_day(callback: CallbackQuery, state: FSMContext):
         await render(callback, "Эта дата не существует.", days_keyboard(year, month))
         return
 
+    if date_cls.fromisoformat(birth_date) > date_cls.today():
+        await render(callback, "Дата рождения не может быть в будущем.", days_keyboard(year, month))
+        return
     await set_birth_date(callback.from_user.id, birth_date)
     await set_zodiac(callback.from_user.id, zodiac_sign(birth_date))
     await set_personal_arcana(callback.from_user.id, personal_arcana_from_birth_date(birth_date))
@@ -1974,7 +1832,13 @@ async def birth_day(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(Onboarding.birth_hour, F.data.startswith("birth_hour:"))
 async def birth_hour(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    hour = int(callback.data.split(":", 1)[1])
+    try:
+        hour = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Кнопка устарела.', show_alert=True)
+        return
+    if not 0 <= hour <= 23:
+        return
     await state.update_data(birth_hour=hour)
     await state.set_state(Onboarding.birth_minute)
     await render(callback, f"<b>Час рождения:</b> {hour:02d}\n\n<b>Выбери минуты:</b>", minutes_keyboard("birth_minute", "back:birth_hour"))
@@ -1983,7 +1847,13 @@ async def birth_hour(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(Onboarding.birth_minute, F.data.startswith("birth_minute:"))
 async def birth_minute(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    minute = int(callback.data.split(":", 1)[1])
+    try:
+        minute = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer('Кнопка устарела.', show_alert=True)
+        return
+    if not 0 <= minute <= 59:
+        return
     data = await state.get_data()
     hour = int(data["birth_hour"])
     birth_time = f"{hour:02d}:{minute:02d}"
@@ -1999,14 +1869,13 @@ async def birth_minute(callback: CallbackQuery, state: FSMContext):
 
 @router.message(Onboarding.birth_place)
 async def birth_place(message: Message, state: FSMContext):
-    place = (message.text or "").strip()
-    if len(place) < 2:
-        await message.answer("Напиши место рождения ещё раз.")
+    place = (message.text or '').strip()
+    if not 2 <= len(place) <= 120 or '\n' in place or place.startswith('/'):
+        await message.answer('Напиши город и страну одной строкой, от 2 до 120 символов. Например: Казань, Россия.')
         return
-
     await set_birth_place(message.from_user.id, place)
     await state.clear()
-    await message.answer("<b>Профиль сохранён.</b>", reply_markup=main_reply_keyboard())
+    await message.answer('<b>Профиль сохранён.</b> Дату, время и место рождения будем учитывать в раскладах.\nЧасовой пояс доставки можно выбрать в профиле.', reply_markup=main_reply_keyboard())
     await send_main_menu(message, state)
 
 
@@ -2040,7 +1909,7 @@ async def notification_loop():
                     continue
 
                 reading_date = now_local.date()
-                reading = generate_daily_reading(user, reading_date)
+                reading = await get_daily_reading(user, reading_date)
                 text = format_full_reading(reading, reading_date)
 
                 try:
@@ -2063,6 +1932,246 @@ async def notification_loop():
 # Fallback
 # ---------------------------
 
+
+async def load_matrix_user(user_id):
+    row = await get_user(user_id)
+    if not row:
+        return None
+    user = dict(row)
+    birth = user['birth_date'] or ''
+    user['_matrix_unlocked'] = await commerce.has_entitlement(user_id, 'matrix', birth)
+    user['_report_unlocked'] = await commerce.has_entitlement(user_id, 'matrix_report', birth)
+    return user
+
+
+async def deliver_matrix(target, user, *, purchase=False, document=False):
+    uid = target.from_user.id
+    message = target.message if isinstance(target, CallbackQuery) else target
+    if uid in _matrix_active:
+        await message.answer('Схема уже готовится — несколько секунд.')
+        return
+    _matrix_active.add(uid)
+    image_path = None
+    status = None
+    try:
+        status = await message.answer('✦ Строю матрицу: рассчитываю точки и соединяю линии…')
+        async with _matrix_workers:
+            image_path = await asyncio.to_thread(build_matrix_image, user)
+        if purchase:
+            result = await commerce.purchase_product(uid, 'matrix', user['birth_date'])
+            if result.status == 'insufficient':
+                await status.edit_text(f'Нужно {MATRIX_PRICE} токенов. Баланс: {result.balance}.', reply_markup=tokens_menu_keyboard())
+                return
+            user = await load_matrix_user(uid)
+        caption = (f"<b>✦ Твоя матрица · {pretty_date(user['birth_date'])}</b>\n\n"
+                   'Схема и разбор используют единый расчёт. Буквы рядом с числами — адреса точек в разборе. '
+                   'Для всех деталей скачай PNG без сжатия.')
+        if document:
+            await message.answer_document(FSInputFile(image_path, filename='Моя матрица.png'), caption=caption, reply_markup=matrix_menu_keyboard(user))
+        else:
+            await message.answer_photo(FSInputFile(image_path), caption=caption, reply_markup=matrix_menu_keyboard(user))
+        await status.edit_text('Матрица готова ✦')
+    except (ValueError, commerce.CommerceError):
+        if status:
+            await status.edit_text('Не удалось построить матрицу для текущего профиля. Проверь дату рождения и попробуй снова. Купленный доступ сохраняется.')
+    except Exception:
+        logging.exception('Matrix rendering or delivery failed')
+        if status:
+            await status.edit_text('Не удалось отправить схему. Открой её ещё раз: купленный доступ сохраняется, повторного списания не будет.')
+    finally:
+        try:
+            if image_path:
+                Path(image_path).unlink(missing_ok=True)
+        finally:
+            _matrix_active.discard(uid)
+
+
+def report_keyboard(page, count):
+    rows = []
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton(text='← Назад', callback_data=f'matrix:report:page:{page-1}'))
+    nav.append(InlineKeyboardButton(text=f'{page+1} / {count}', callback_data='matrix:report:noop'))
+    if page + 1 < count:
+        nav.append(InlineKeyboardButton(text='Далее →', callback_data=f'matrix:report:page:{page+1}'))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text='Скачать весь разбор со схемой', callback_data='matrix:report:download')])
+    rows.append([InlineKeyboardButton(text='✦ Схема матрицы', callback_data='menu:matrix'),
+                 InlineKeyboardButton(text='Главное меню', callback_data='back:main')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == 'matrix:buy')
+async def legacy_matrix_purchase(callback: CallbackQuery):
+    # Old confirmation buttons never silently charge for a changed profile.
+    await matrix_buy_prompt(callback)
+
+
+@router.callback_query(F.data == 'matrix:download')
+async def matrix_download(callback: CallbackQuery):
+    await callback.answer()
+    user = await load_matrix_user(callback.from_user.id)
+    if not user or not user['birth_date'] or not matrix_access_active(user):
+        await send_matrix_menu(callback)
+        return
+    await deliver_matrix(callback, user, document=True)
+
+
+@router.callback_query(F.data == 'matrix:report:prompt')
+async def report_prompt(callback: CallbackQuery):
+    await callback.answer()
+    user = await load_matrix_user(callback.from_user.id)
+    if not user or not user['birth_date']:
+        await render(callback, 'Сначала заполни дату рождения.', main_menu_keyboard(callback.from_user.id))
+        return
+    if user['_report_unlocked']:
+        await deliver_report(callback, user)
+        return
+    await render(callback,
+        f"<b>Полный разбор твоей матрицы</b>\n\nДата: {pretty_date(user['birth_date'])}\n\n"
+        'Личность и таланты, обе родовые линии, отношения, реализация, повторяющиеся уроки, '
+        'направления развития и таблица ресурсов. Каждая точка схемы объяснена: что означает, '
+        'как может проявляться и с чем поработать.\n\n'
+        'Включены схема в полном качестве и полный файл для сохранения. '
+        'Повторное открытие для этой даты бесплатно.\n\n'
+        f"Стоимость: <b>{MATRIX_REPORT_PRICE} токенов</b>\nБаланс: <b>{user['tokens']}</b>",
+        confirm_keyboard('matrix:report:buy:' + user['birth_date'], 'menu:matrix', f'Получить за {MATRIX_REPORT_PRICE} токенов'))
+
+
+async def deliver_report(callback, user, *, purchase=False, page=0, document=False):
+    uid = callback.from_user.id
+    if uid in _matrix_active:
+        await callback.message.answer('Твой разбор уже готовится.')
+        return
+    _matrix_active.add(uid)
+    status = None
+    output_path = None
+    try:
+        if purchase or document or page == 0:
+            status = await callback.message.answer('✦ Загружаю разбор матрицы: проверяю значения и собираю разделы…')
+        async with _matrix_workers:
+            chunks = await asyncio.to_thread(build_matrix_report, user)
+            if document:
+                output_path = await asyncio.to_thread(build_matrix_report_html, user)
+        if purchase:
+            result = await commerce.purchase_product(uid, 'matrix_report', user['birth_date'])
+            if result.status == 'insufficient':
+                await status.edit_text(f'Нужно {MATRIX_REPORT_PRICE} токенов. Баланс: {result.balance}.', reply_markup=tokens_menu_keyboard())
+                return
+        if document:
+            await callback.message.answer_document(FSInputFile(output_path, filename='Разбор моей матрицы.html'),
+                caption='Полный разбор со схемой. Открой файл в браузере; он работает без интернета. Через «Печать» можно сохранить PDF.')
+        else:
+            page = max(0, min(page, len(chunks)-1))
+            if page == 0 or purchase:
+                await callback.message.answer(chunks[page], reply_markup=report_keyboard(page, len(chunks)))
+            else:
+                await render(callback, chunks[page], report_keyboard(page, len(chunks)))
+        if status:
+            await status.edit_text('Разбор готов. Он сохранён в твоих покупках — возвращайся без повторной оплаты ✦')
+    except Exception:
+        logging.exception('Matrix report delivery failed')
+        text = 'Не удалось подготовить или отправить разбор. Попробуй открыть его ещё раз. Купленный доступ сохраняется, повторного списания не будет.'
+        if status:
+            await status.edit_text(text)
+        else:
+            await callback.message.answer(text)
+    finally:
+        try:
+            if output_path:
+                Path(output_path).unlink(missing_ok=True)
+        finally:
+            _matrix_active.discard(uid)
+
+
+@router.callback_query(F.data.startswith('matrix:report:'))
+async def report_actions(callback: CallbackQuery):
+    await callback.answer()
+    if callback.data == 'matrix:report:noop':
+        return
+    user = await load_matrix_user(callback.from_user.id)
+    if not user or not user['birth_date']:
+        await render(callback, 'Сначала заполни дату рождения.', main_menu_keyboard(callback.from_user.id))
+        return
+    purchase = callback.data.startswith('matrix:report:buy:')
+    if purchase and callback.data.rsplit(':', 1)[-1] != user['birth_date']:
+        await render(callback, 'Дата в профиле изменилась. Открой актуальное предложение.', matrix_menu_keyboard(user))
+        return
+    if not user['_report_unlocked'] and not purchase:
+        await render(callback, 'Подробный разбор ещё не открыт.', matrix_menu_keyboard(user))
+        return
+    if purchase and not user['_report_unlocked'] and user['tokens'] < MATRIX_REPORT_PRICE:
+        await render(callback, f'Для разбора нужно {MATRIX_REPORT_PRICE} токенов. Баланс: {user["tokens"]}.', tokens_menu_keyboard())
+        return
+    page = 0
+    if callback.data.startswith('matrix:report:page:'):
+        try:
+            page = int(callback.data.rsplit(':', 1)[-1])
+        except ValueError:
+            return
+    await deliver_report(callback, user, purchase=purchase, page=page, document=callback.data == 'matrix:report:download')
+
+
+@router.callback_query(F.data == 'profile:consent')
+async def profile_consent(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await upsert_user(callback.from_user.id, callback.from_user.full_name, callback.from_user.username)
+    await accept_consent(callback.from_user.id)
+    await start_profile_flow(callback, state, await get_user(callback.from_user.id))
+
+
+@router.message(Command('privacy'))
+async def privacy(message: Message):
+    await message.answer(privacy_text())
+
+
+TIMEZONES = {
+    'kaliningrad': ('Калининград · UTC+2', 'Europe/Kaliningrad'),
+    'moscow': ('Москва · UTC+3', 'Europe/Moscow'),
+    'samara': ('Самара · UTC+4', 'Europe/Samara'),
+    'ekaterinburg': ('Екатеринбург · UTC+5', 'Asia/Yekaterinburg'),
+    'omsk': ('Омск · UTC+6', 'Asia/Omsk'),
+    'krasnoyarsk': ('Красноярск · UTC+7', 'Asia/Krasnoyarsk'),
+    'irkutsk': ('Иркутск · UTC+8', 'Asia/Irkutsk'),
+    'yakutsk': ('Якутск · UTC+9', 'Asia/Yakutsk'),
+    'vladivostok': ('Владивосток · UTC+10', 'Asia/Vladivostok'),
+    'magadan': ('Магадан · UTC+11', 'Asia/Magadan'),
+    'kamchatka': ('Камчатка · UTC+12', 'Asia/Kamchatka'),
+}
+
+
+@router.callback_query(F.data == 'profile:timezone')
+async def timezone_menu(callback: CallbackQuery):
+    await callback.answer()
+    rows = [[InlineKeyboardButton(text=title, callback_data='profile:tz:' + key)] for key, (title, _) in TIMEZONES.items()]
+    rows.append([InlineKeyboardButton(text='⬅️ Профиль', callback_data='menu:profile')])
+    rows.append([InlineKeyboardButton(text='⏰ Доставка расклада', callback_data='menu:schedule')])
+    await render(callback, '<b>Часовой пояс</b>\n\nВыбери пояс, в котором хочешь получать расклады. Это настройка текущего дня и доставки; место рождения в профиле сохраняется.', InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@router.callback_query(F.data.startswith('profile:tz:'))
+async def timezone_save(callback: CallbackQuery):
+    await callback.answer()
+    choice = TIMEZONES.get(callback.data.rsplit(':', 1)[-1])
+    if not choice:
+        return
+    from db import DB_NAME
+    async with aiosqlite.connect(DB_NAME) as connection:
+        await connection.execute('UPDATE users SET timezone=?,updated_at=? WHERE telegram_id=?',
+                                 (choice[1], datetime.now(timezone.utc).isoformat(), callback.from_user.id))
+        await connection.commit()
+    await render(callback, 'Часовой пояс сохранён: ' + e(choice[0]), profile_menu_keyboard(True))
+
+
+@router.message(Command('terms'))
+async def terms(message: Message):
+    await message.answer(terms_text())
+
+
+@router.callback_query()
+async def stale_button(callback: CallbackQuery):
+    await callback.answer('Эта кнопка устарела. Открой /menu и продолжи.', show_alert=True)
+
 @router.message()
 async def unknown_message(message: Message):
     if message.text and message.text.startswith("/"):
@@ -2075,13 +2184,35 @@ async def unknown_message(message: Message):
 # ---------------------------
 
 async def main():
-    global BOT_USERNAME
+    global BOT_USERNAME, bot
+    settings = get_settings()
+    settings.validate_startup()
     await init_db()
-    me = await bot.get_me()
-    BOT_USERNAME = me.username
-    logging.info("Bot username: %s", BOT_USERNAME)
-    asyncio.create_task(notification_loop())
-    await dp.start_polling(bot)
+    await commerce.init_commerce()
+    launch_result = run_configured_actions()
+    if launch_result['status'] != 'not_requested':
+        logging.info('Owner launch action: %s', launch_result)
+    await init_app()
+    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    tasks = []
+    try:
+        me = await bot.get_me()
+        BOT_USERNAME = me.username
+        await bot.set_my_commands([
+            BotCommand(command='menu', description='Главное меню'),
+            BotCommand(command='profile', description='Мой профиль'),
+            BotCommand(command='tokens', description='Кошелёк и покупки'),
+            BotCommand(command='paysupport', description='Помощь с оплатой'),
+            BotCommand(command='privacy', description='Данные и конфиденциальность'),
+            BotCommand(command='terms', description='Условия использования'),
+        ])
+        tasks = [asyncio.create_task(notification_loop()), asyncio.create_task(reconciliation_loop(bot))]
+        await dp.start_polling(bot, close_bot_session=False)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await bot.session.close()
 
 
 if __name__ == "__main__":

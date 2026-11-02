@@ -1,9 +1,12 @@
-import random
+import os
+import uuid
+from pathlib import Path
 from datetime import datetime, timezone
 
 import aiosqlite
 
-DB_NAME = "users.db"
+_configured_db = Path(os.environ.get("DB_PATH") or os.environ.get("DB_NAME") or "users.db").expanduser()
+DB_NAME = str(_configured_db if _configured_db.is_absolute() else Path(__file__).resolve().parent / _configured_db)
 
 
 def now_iso() -> str:
@@ -30,7 +33,10 @@ async def _ensure_column(db: aiosqlite.Connection, table: str, column: str, ddl:
 
 
 async def init_db() -> None:
+    Path(DB_NAME).parent.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=10000")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -79,6 +85,19 @@ async def init_db() -> None:
         await _ensure_column(db, "users", "created_at", "TEXT NOT NULL DEFAULT ''")
         await _ensure_column(db, "users", "updated_at", "TEXT NOT NULL DEFAULT ''")
 
+        await db.execute("""CREATE TABLE IF NOT EXISTS token_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id TEXT NOT NULL UNIQUE,
+            user_id INTEGER NOT NULL,
+            delta INTEGER NOT NULL,
+            balance_after INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            actor_id INTEGER,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_user ON token_transactions(user_id, id DESC)")
+
         await db.commit()
 
 
@@ -106,6 +125,67 @@ async def get_user_by_username(username: str):
             return await cursor.fetchone()
 
 
+async def delete_user_data(telegram_id: int) -> dict:
+    """Delete all user-linked records in one transaction.
+
+    Payment and token journal rows are removed at the user's explicit deletion
+    request; this operation is reserved for the authenticated admin panel.
+    Reading cache has no user id, so it is cleared as a conservative privacy
+    measure rather than attempting to infer ownership from a hash.
+    """
+    uid = int(telegram_id)
+    if uid <= 0:
+        raise ValueError("Некорректный Telegram ID")
+    async with aiosqlite.connect(DB_NAME, timeout=10) as connection:
+        await connection.execute("PRAGMA foreign_keys=ON")
+        await connection.execute("PRAGMA busy_timeout=10000")
+        await connection.execute("BEGIN IMMEDIATE")
+        try:
+            exists = await (await connection.execute(
+                "SELECT 1 FROM users WHERE telegram_id=?", (uid,))).fetchone()
+            if exists is None:
+                await connection.rollback()
+                return {"deleted": False, "user_id": uid, "counts": {}}
+            tables = {row[0] for row in await (await connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'" )).fetchall()}
+            counts = {}
+            if "payment_orders" in tables:
+                counts["payment_orders"] = (await (await connection.execute(
+                    "SELECT COUNT(*) FROM payment_orders WHERE user_id=?", (uid,))).fetchone())[0]
+            if "refund_attempts" in tables and "payment_orders" in tables:
+                counts["refund_attempts"] = (await (await connection.execute(
+                    "SELECT COUNT(*) FROM refund_attempts WHERE order_id IN "
+                    "(SELECT order_id FROM payment_orders WHERE user_id=?)", (uid,))).fetchone())[0]
+            for table, column in (("token_transactions", "user_id"), ("product_entitlements", "user_id"),
+                                  ("user_consents", "user_id")):
+                if table in tables:
+                    counts[table] = (await (await connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {column}=?", (uid,))).fetchone())[0]
+            if "reading_cache" in tables:
+                counts["reading_cache"] = (await (await connection.execute(
+                    "SELECT COUNT(*) FROM reading_cache")).fetchone())[0]
+
+            await connection.execute("UPDATE users SET referrer_id=NULL WHERE referrer_id=?", (uid,))
+            if "refund_attempts" in tables and "payment_orders" in tables:
+                await connection.execute(
+                    "DELETE FROM refund_attempts WHERE order_id IN "
+                    "(SELECT order_id FROM payment_orders WHERE user_id=?)", (uid,))
+            if "payment_orders" in tables:
+                await connection.execute("DELETE FROM payment_orders WHERE user_id=?", (uid,))
+            for table, column in (("token_transactions", "user_id"), ("product_entitlements", "user_id"),
+                                  ("user_consents", "user_id")):
+                if table in tables:
+                    await connection.execute(f"DELETE FROM {table} WHERE {column}=?", (uid,))
+            if "reading_cache" in tables:
+                await connection.execute("DELETE FROM reading_cache")
+            await connection.execute("DELETE FROM users WHERE telegram_id=?", (uid,))
+            await connection.commit()
+            return {"deleted": True, "user_id": uid, "counts": counts}
+        except BaseException:
+            await connection.rollback()
+            raise
+
+
 async def get_all_users():
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
@@ -120,12 +200,13 @@ async def upsert_user(
     username: str | None = None,
     referrer_id: int | None = None,
 ) -> bool:
-    current = await get_user(telegram_id)
     username = normalize_username(username)
     ts = now_iso()
 
     async with aiosqlite.connect(DB_NAME) as db:
-        if current is None:
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute("SELECT 1 FROM users WHERE telegram_id = ?", (telegram_id,))
+        if await cursor.fetchone() is None:
             await db.execute(
                 """
                 INSERT INTO users (
@@ -342,8 +423,11 @@ async def set_last_daily_sent_date(telegram_id: int, sent_date: str) -> None:
 
 
 async def add_tokens(user_id: int, amount: int) -> None:
+    if type(amount) is not int or amount <= 0:
+        raise ValueError("Token credit must be a positive integer")
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
             """
             UPDATE users
             SET tokens = COALESCE(tokens, 0) + ?,
@@ -352,25 +436,33 @@ async def add_tokens(user_id: int, amount: int) -> None:
             """,
             (amount, now_iso(), user_id),
         )
+        if cursor.rowcount != 1:
+            raise ValueError("Unknown user")
+        balance = await (await db.execute("SELECT tokens FROM users WHERE telegram_id = ?", (user_id,))).fetchone()
+        await db.execute("INSERT INTO token_transactions(request_id,user_id,delta,balance_after,kind,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                         ("credit:" + uuid.uuid4().hex, user_id, amount, balance[0], "legacy_credit", "Application credit", now_iso()))
         await db.commit()
 
 
 async def spend_tokens(user_id: int, amount: int) -> bool:
-    user = await get_user(user_id)
-    current = int(user["tokens"] or 0) if user else 0
-    if current < amount:
-        return False
-
+    if type(amount) is not int or amount <= 0:
+        raise ValueError("Token debit must be a positive integer")
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
+        await db.execute("BEGIN IMMEDIATE")
+        cursor = await db.execute(
             """
             UPDATE users
             SET tokens = COALESCE(tokens, 0) - ?,
                 updated_at = ?
-            WHERE telegram_id = ?
+            WHERE telegram_id = ? AND COALESCE(tokens, 0) >= ?
             """,
-            (amount, now_iso(), user_id),
+            (amount, now_iso(), user_id, amount),
         )
+        if cursor.rowcount != 1:
+            return False
+        balance = await (await db.execute("SELECT tokens FROM users WHERE telegram_id = ?", (user_id,))).fetchone()
+        await db.execute("INSERT INTO token_transactions(request_id,user_id,delta,balance_after,kind,reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                         ("debit:" + uuid.uuid4().hex, user_id, -amount, balance[0], "legacy_debit", "Application debit", now_iso()))
         await db.commit()
         return True
 
